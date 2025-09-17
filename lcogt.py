@@ -34,7 +34,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 class lcogt(object):
-    def __init__(self, f):
+    def __init__(self):
 
         uri_base = 'https://observe.lco.global/'
         archive_base = 'https://archive-api.lco.global/'

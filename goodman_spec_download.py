@@ -9,8 +9,6 @@ import os
 import argparse
 import copy
 
-lco = lcogt('/home/ckilpatrick/scripts/tokens/shibboleth')
-
 def parse_arguments(usage=''):
 
     parser = argparse.ArgumentParser(description=usage)
@@ -27,6 +25,8 @@ def parse_arguments(usage=''):
     return(args)
 
 def main(date, propid, outdir='.'):
+
+    lco = lcogt()
 
     args = parse_arguments()
 

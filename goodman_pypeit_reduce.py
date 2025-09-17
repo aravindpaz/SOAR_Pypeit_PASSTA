@@ -12,8 +12,6 @@ import argparse
 import copy
 import time
 
-lco = lcogt('/home/ckilpatrick/scripts/tokens/shibboleth')
-
 def parse_arguments(usage=''):
 
     parser = argparse.ArgumentParser(description=usage)
@@ -40,6 +38,8 @@ def refresh_astropy_cache():
 
 
 def main(date, outdir):
+
+    lco = lcogt()
 
     basedir = outdir
     datedir = Time(date).datetime.strftime('%Y%m%d')
