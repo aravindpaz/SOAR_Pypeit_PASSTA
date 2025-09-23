@@ -7,6 +7,7 @@ from astropy.io import ascii
 from astropy.time import Time
 from astropy.table import Table
 from astropy.table import vstack
+from astropy.table import unique
 import numpy as np
 import glob
 import sys
@@ -14,7 +15,20 @@ import os
 import argparse
 import copy
 import time
+import shutil
 
+def refresh_astropy_cache():
+
+    tries = 0
+    while tries<5:
+        try:
+            astropy.coordinates.EarthLocation.get_site_names(refresh_cache=True)
+            break
+        except urllib.error.URLError:
+            tries += 1
+            time.sleep(5)
+
+refresh_astropy_cache()
 from pypeit import inputfiles
 
 def parse_arguments(usage=''):
@@ -28,17 +42,6 @@ def parse_arguments(usage=''):
     args = parser.parse_args()
 
     return(args)
-
-def refresh_astropy_cache():
-
-    tries = 0
-    while tries<5:
-        try:
-            astropy.coordinates.EarthLocation.get_site_names(refresh_cache=True)
-            break
-        except urllib.error.URLError:
-            tries += 1
-            time.sleep(5)
 
 
 def parse_pypeit_output(scidir, pypeit_table, caldb, slit_pos=520, pix_tolerance=15):
@@ -60,9 +63,9 @@ def parse_pypeit_output(scidir, pypeit_table, caldb, slit_pos=520, pix_tolerance
             slitname = row['decker']
 
             framebase = row['filename'].replace('.fits','').replace('.fz','')
-            outfile = glob.glob(os.path.join(f'spec1d_{framebase}*.txt'))[0]
+            outfile = glob.glob(os.path.join(scidir, f'spec1d_{framebase}*.txt'))[0]
 
-            spectable = ascii.read(outfile)
+            spectable = ascii.read(outfile, delimiter='|', header_start=0)
 
             # Get the objects that are within tolerance of expected slit position
             mask = np.abs(spectable['spat_pixpos']-slit_pos) < pix_tolerance
@@ -81,7 +84,7 @@ def parse_pypeit_output(scidir, pypeit_table, caldb, slit_pos=520, pix_tolerance
         elif row['frametype']=='standard':
 
             framebase = row['filename'].replace('.fits','').replace('.fz','')
-            outfile = glob.glob(os.path.join(f'spec1d_{framebase}*.fits'))[0]
+            outfile = glob.glob(os.path.join(scidir, f'spec1d_{framebase}*.fits'))[0]
 
             target = row['target'].lower()
             ra = row['ra']
@@ -95,13 +98,23 @@ def parse_pypeit_output(scidir, pypeit_table, caldb, slit_pos=520, pix_tolerance
             sensfilename = f'{target}.{dispname}.{slitname}.{datestr}_sensfunc.fits'
             fullsensfilename = os.path.join(caldb, sensfilename)
             senslog = os.path.join(scidir, sensfilename).replace('.fits','.log')
+            par_outfile = os.path.join(scidir, 'sensfunc.par')
 
             if not os.path.exists(caldb):
                 os.makedirs(caldb)
+            if not os.path.exists(os.path.join(caldb, 'plots')):
+                os.makedirs(os.path.join(caldb, 'plots'))
 
-            cmd = f'pypeit_sensfunc {outfile} -o {fullsensfilename} > {senslog} 2> {senslog}'
+            cmd = f'pypeit_sensfunc {outfile} -o {fullsensfilename} --par_outfile {par_outfile} > {senslog} 2> {senslog}'
             print(cmd)
             os.system(cmd)
+
+            for file in glob.glob(os.path.join(caldb, '*.pdf')):
+                newfile = os.path.join(caldb, 'plots', os.path.basename(file))
+                if not os.path.exists(newfile):
+                    shutil.move(file, os.path.join(caldb, 'plots'))
+                else:
+                    os.remove(file)
 
             if os.path.exists(fullsensfilename):
 
@@ -112,13 +125,15 @@ def parse_pypeit_output(scidir, pypeit_table, caldb, slit_pos=520, pix_tolerance
                     caldb_table = Table(names=names, dtype=dtype)
 
                     caldb_table.add_row((os.path.basename(sensfilename), target, ra, dec, mjd, dispname, slitname, airmass))
+                    caldb_table = unique(caldb_table)
 
-                    caldb_table.write(caldbfile, format='ascii.ecsv')
+                    caldb_table.write(caldbfile, format='ascii.ecsv', overwrite=True)
                 else:
                     caldb_table = ascii.read(caldbfile)
                     caldb_table.add_row((os.path.basename(sensfilename), target, ra, dec, mjd, dispname, slitname, airmass))
+                    caldb_table = unique(caldb_table)
 
-                    caldb_table.write(caldbfile, format='ascii.ecsv')
+                    caldb_table.write(caldbfile, format='ascii.ecsv', overwrite=True)
 
     return(objdata)
 
@@ -141,6 +156,8 @@ def make_flux_file(objdata, fullsensfile):
 
         for obj in objdata:
             filename = obj[0]
+            if filename.endswith('.txt'):
+                filename = filename.replace('.txt','.fits')
             f.write(f'{filename} | {fullsensfile} \n')
 
         f.write('flux end \n')
@@ -148,7 +165,7 @@ def make_flux_file(objdata, fullsensfile):
     if os.path.exists(flux_filename):
         return(flux_filename)
 
-def make_coadd_file(obj, fullout_1dfilename):
+def make_coadd_file(objdata, fullout_1dfilename):
 
     outfile = objdata[0][0]
     target = objdata[0][2]
@@ -163,10 +180,12 @@ def make_coadd_file(obj, fullout_1dfilename):
         f.write(f'  wave_method = linear \n\n')
         f.write('coadd1d read \n')
         f.write(f'  path {dirname} \n')
-        f.write('filename | objid \n')
+        f.write('filename | obj_id \n')
 
         for obj in objdata:
             filename = obj[0]
+            if filename.endswith('.txt'):
+                filename = filename.replace('.txt','.fits')
             objname = obj[1]
             f.write(f'{filename} | {objname} \n')
 
@@ -179,62 +198,70 @@ def make_coadd_file(obj, fullout_1dfilename):
 
 def pypeit_post_process(objdata, specdir, caldb_dir):
 
-    caldb_file = os.path.join(cald_dir, 'caldb.txt')
+    caldb_file = os.path.join(caldb_dir, 'caldb.txt')
     if not os.path.exists(caldb_file):
         raise Exception(f'Could not locate calibration database: {caldb_file}')
 
     caldb = ascii.read(caldb_file)
 
-    for obj in objdata:
+    outlinks = []
 
-        firstobj = obj[0]
-        outfile, objname, mjd, dispname, slitname = firstobj
-        dirname, _ = os.path.split(outfile)
+    firstobj = objdata[0]
+    
+    outfile, objname, target, mjd, dispname, slitname = firstobj
+    dirname, _ = os.path.split(outfile)
 
-        datestr = Time(mjd, format='mjd').datetime.strftime('%Y%m%d')
+    datestr = Time(mjd, format='mjd').datetime.strftime('%Y%m%d')
 
-        mask = (caldb['dispname']==dispname) & (caldb['slitname']==slitname)
-        goodcals = caldb[mask]
+    mask = (caldb['dispname']==dispname) & (caldb['slitname']==slitname)
+    goodcals = caldb[mask]
 
-        # Get closest flux standard in time from good calibrations 
-        idx = np.argmin(np.abs(goodcals['mjd']-mjd))
+    # Get closest flux standard in time from good calibrations 
+    idx = np.argmin(np.abs(goodcals['mjd']-mjd))
 
-        fullsensfile = os.path.join(caldb_dir, goodcals[idx]['filename'])
+    fullsensfile = os.path.join(caldb_dir, goodcals[idx]['filename'])
 
-        flux_filename = make_flux_file(obj, fullsensfile)
-        flux_logname = os.path.join(dirname, 'flux.log')
+    flux_filename = make_flux_file(objdata, fullsensfile)
+    flux_logname = os.path.join(dirname, 'flux.log')
+    par_outfile = os.path.join(dirname, 'fluxing.par')
 
-        # Run pypeit flux calibration on flux file
-        cmd = f'pypeit_flux_calib {flux_filename} > {flux_logname} 2> {flux_logname}'
+    # Run pypeit flux calibration on flux file
+    cmd = f'pypeit_flux_calib {flux_filename} --par_outfile {par_outfile} > {flux_logname} 2> {flux_logname}'
+    print(cmd)
+    os.system(cmd)
+
+    # Now that files are fluxed, need to coadd into one file
+    out_1dfilename = f'{target}.{datestr}.{dispname}.coadd1d.fits'
+    fullout_1dfilename = os.path.join(dirname, out_1dfilename)
+    full_tellcorrfilename = fullout_1dfilename.replace('.fits','_tellcorr.fits')
+
+    coadd_filename = make_coadd_file(objdata, fullout_1dfilename)
+    coadd_logname = os.path.join(dirname, 'coadd.log')
+    par_outfile = os.path.join(dirname, 'coadd1d.par')
+
+    cmd = f'pypeit_coadd_1dspec {coadd_filename} --par_outfile {par_outfile} > {coadd_logname} 2> {coadd_logname}'
+    print(cmd)
+    os.system(cmd)
+
+    if os.path.exists(fullout_1dfilename):
+        tellcorr_logname = os.path.join(dirname, 'tellcorr.log')
+        par_outfile = os.path.join(dirname, 'tellfit.par')
+
+        # Run telluric correction
+        os.chdir(dirname)
+        cmd = f'pypeit_tellfit {fullout_1dfilename} --objmodel poly --par_outfile {par_outfile} > {tellcorr_logname} 2> {tellcorr_logname}'
         print(cmd)
         os.system(cmd)
 
-        # Now that files are fluxed, need to coadd into one file
-        out_1dfilename = f'{objname}.{datestr}.{dispname}.coadd1d.fits'
-        fullout_1dfilename = os.path.join(dirname, out_1dfilename)
-        full_tellcorrfilename = fullout_1dfilename.replace('.fits','_tellcorr.fits')
+    if os.path.exists(full_tellcorrfilename):
+        outlink = os.path.join(specdir, os.path.basename(full_tellcorrfilename))
 
-        coadd_filename = make_coadd_file(obj, fullout_1dfilename)
-        coadd_logname = os.path.join(dirname, 'coadd.log')
-
-        cmd = f'pypeit_coadd_1dspec {coadd_filename} > {coadd_logname} 2> {coadd_logname}'
-        print(cmd)
-        os.system(cmd)
-
-        if os.path.exists(fullout_1dfilename):
-            tellcorr_logname = os.path.join(dirname, 'tellcorr.log')
-
-            # Run telluric correction
-            cmd = f'pypeit_tellfit {fullout_1dfilename} --objmodel poly > {tellcorr_logname} 2> {tellcorr_logname}'
-            print(cmd)
-            os.system(cmd)
-
-        if os.path.exists(full_tellcorrfilename):
-            outlink = os.path.join(specdir, os.path.basename(full_tellcorrfilename))
+        if not os.path.exists(outlink):
             os.symlink(full_tellcorrfilename, outlink)
 
-            if os.path.exists(outlink):
-                print(f'Linked {full_tellcorrfilename}->{outlink}')
+        if os.path.exists(outlink):
+            print(f'Linked {full_tellcorrfilename}->{outlink}')
+            return(outlink)
 
 def main(date, outdir, caldb_dir):
     """
@@ -251,8 +278,12 @@ def main(date, outdir, caldb_dir):
     fullworkdir = os.path.join(outdir, datedir, 'workspace')
     fullspecdir = os.path.join(outdir, 'spectra')
 
+    if not os.path.exists(fulloutdir):
+        os.makedirs(fulloutdir)
     if not os.path.exists(fullworkdir):
         os.makedirs(fullworkdir)
+    if not os.path.exists(fullspecdir):
+        os.makedirs(fullspecdir)
 
     # Create one reduction directory per object so they have the correct arc
     files = sorted(glob.glob(os.path.join(fulloutdir, '*.fz')))
@@ -339,10 +370,19 @@ def main(date, outdir, caldb_dir):
     
     for objdir in reduction_dirs:
 
-        refresh_astropy_cache()
-        cmd = f'pypeit_setup -s {spec} -c all -r {objdir} -d {objdir} > {objdir}/setup.log 2> {objdir}/setup.log'
-        print(cmd)
-        os.system(cmd)
+        tries = 0
+        while tries<5:
+            try:
+                refresh_astropy_cache()
+                cmd = f'pypeit_setup -s {spec} -c all -r {objdir} -d {objdir} > {objdir}/setup.log 2> {objdir}/setup.log'
+                print(cmd)
+                os.system(cmd)
+                break
+            except astropy.coordinates.errors.UnknownSiteException:
+                tries+=1
+
+        if tries==5:
+            raise Exception('Could not get astropy cache to refresh...')
 
     all_objdata = []
     for objdir in reduction_dirs:
@@ -365,11 +405,10 @@ def main(date, outdir, caldb_dir):
         if len(objdata)>0:
             all_objdata.append(objdata)
 
-
-
-
-
-
+    outlinks = []
+    for objdata in all_objdata:
+        scidir, _ = os.path.split(objdata[0][0])
+        outlinks.append(pypeit_post_process(objdata, fullspecdir, caldb_dir))
 
 
 if __name__=="__main__":

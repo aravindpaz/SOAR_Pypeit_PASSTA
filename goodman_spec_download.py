@@ -14,7 +14,7 @@ def parse_arguments(usage=''):
     parser = argparse.ArgumentParser(description=usage)
     parser.add_argument('date', type=str, default='.',
                         help='Input date to download data.')
-    parser.add_argument('propid', type=str, default='',
+    parser.add_argument('--propid', type=str, default='SOAR2025B-004',
                         help='Proposal ID from which to download data '+\
                         '(can be comma-separated list).')
     parser.add_argument('--outdir', type=str, default='.',
@@ -47,6 +47,7 @@ def main(date, propid, outdir='.'):
 
     for propid in propid.split(','):
 
+        propid = propid.strip()
         telid='4m0a'
 
         obslist = lco.get_obslist(sdate=sdate, edate=edate,
@@ -78,7 +79,7 @@ def main(date, propid, outdir='.'):
                 instlist.append(obs['INSTRUME'].lower())
 
         if len(instlist)==0:
-            print('No observations for today.  Exiting...')
+            print(f'No observations for {date}.  Exiting...')
             sys.exit()
 
         # Get associated calibration images

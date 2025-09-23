@@ -1,0 +1,15 @@
+# %ECSV 1.0
+# ---
+# datatype:
+# - {name: filename, datatype: string}
+# - {name: target, datatype: string}
+# - {name: ra, datatype: float64}
+# - {name: dec, datatype: float64}
+# - {name: mjd, datatype: float64}
+# - {name: dispname, datatype: string}
+# - {name: slitname, datatype: string}
+# - {name: airmass, datatype: float64}
+# schema: astropy-2.0
+filename target ra dec mjd dispname slitname airmass
+hr5501.400_M1.1.0_LONG_SLIT.20250828_sensfunc.fits hr5501 221.3750458333333 0.7154722222222222 60915.963245625 400_M1 1.0_LONG_SLIT 1.38
+hr5501.400_M2.1.0_LONG_SLIT.20250828_sensfunc.fits hr5501 221.3750333333333 0.7154330555555555 60915.964814976855 400_M2 1.0_LONG_SLIT 1.39

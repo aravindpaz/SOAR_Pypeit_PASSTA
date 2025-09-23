@@ -381,10 +381,7 @@ class lcogt(object):
         fmt=self.params['date_format']
         results = []
         propids = []
-        #if rlevel is not None:
-        #    params['RLEVEL'] = rlevel
-        #else:
-        #    params['RLEVEL'] = 91
+
         if propid is not None:
             propids = list(propid)
         if sdate is not None:
