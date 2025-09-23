@@ -8,6 +8,7 @@ import sys
 import os
 import argparse
 import copy
+import shutil
 
 def parse_arguments(usage=''):
 
@@ -79,8 +80,8 @@ def main(date, propid, outdir='.'):
                 instlist.append(obs['INSTRUME'].lower())
 
         if len(instlist)==0:
-            print(f'No observations for {date}.  Exiting...')
-            sys.exit()
+            print(f'No observations for {date}.  Continuing...')
+            continue
 
         # Get associated calibration images
         flatlist = lco.get_obslist(sdate=sdate, edate=edate, telid=telid, 
@@ -113,6 +114,14 @@ def main(date, propid, outdir='.'):
         lco.download_obslist(callist, outrootdir=fulloutdir, skip_header=True, funpack=False)
         lco.download_obslist(flatlist, outrootdir=fulloutdir, skip_header=True, funpack=False)
         lco.download_obslist(arclist, outrootdir=fulloutdir, skip_header=True, funpack=False)
+
+    # Clean up directories if there was nothing to download
+    if ((len(glob.glob(os.path.join(fulloutdir, '*')))==0) and
+        (len(glob.glob(os.path.join(fullworkdir, '*')))==0)):
+
+        shutil.rmtree(os.path.join(outdir, datedir))
+
+
 
 if __name__=='__main__':
     args = parse_arguments()

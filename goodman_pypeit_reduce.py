@@ -23,6 +23,8 @@ def refresh_astropy_cache():
     while tries<5:
         try:
             astropy.coordinates.EarthLocation.get_site_names(refresh_cache=True)
+            time.sleep(0.5)
+            astropy.coordinates.EarthLocation.get_site_names()
             break
         except urllib.error.URLError:
             tries += 1
@@ -226,7 +228,7 @@ def pypeit_post_process(objdata, specdir, caldb_dir):
     par_outfile = os.path.join(dirname, 'fluxing.par')
 
     # Run pypeit flux calibration on flux file
-    cmd = f'pypeit_flux_calib {flux_filename} --par_outfile {par_outfile} > {flux_logname} 2> {flux_logname}'
+    cmd = f'pypeit_flux_calib --par_outfile {flux_filename} > {flux_logname} 2> {flux_logname}'
     print(cmd)
     os.system(cmd)
 
@@ -278,10 +280,12 @@ def main(date, outdir, caldb_dir):
     fullworkdir = os.path.join(outdir, datedir, 'workspace')
     fullspecdir = os.path.join(outdir, 'spectra')
 
-    if not os.path.exists(fulloutdir):
-        os.makedirs(fulloutdir)
-    if not os.path.exists(fullworkdir):
-        os.makedirs(fullworkdir)
+    # These should already exist from goodman_spec_download.py, if not then exit
+    if not os.path.exists(fulloutdir) and not os.path.exists(fullworkdir):
+        print(f'No data to process for {date}...')
+        sys.exit()
+    
+    # Make output spectrum directory if it does not exist
     if not os.path.exists(fullspecdir):
         os.makedirs(fullspecdir)
 
