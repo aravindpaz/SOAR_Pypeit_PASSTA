@@ -46,7 +46,7 @@ def parse_arguments(usage=''):
     return(args)
 
 
-def parse_pypeit_output(scidir, pypeit_table, caldb, slit_pos=520, pix_tolerance=15):
+def parse_pypeit_output(scidir, pypeit_table, caldb, slit_pos=505, pix_tolerance=[15, 30, 60]):
     """
     Takes the output from a science directory and parses the output to produce
     list of 1D files or standards that need to be converted to sensitivity functions.
@@ -56,6 +56,7 @@ def parse_pypeit_output(scidir, pypeit_table, caldb, slit_pos=520, pix_tolerance
     for row in pypeit_table.data:
         if row['frametype']=='science':
 
+            filename = row['filename']
             target = row['target'].lower()
             ra = row['ra']
             dec = row['dec']
@@ -64,23 +65,38 @@ def parse_pypeit_output(scidir, pypeit_table, caldb, slit_pos=520, pix_tolerance
             dispname = row['mode']
             slitname = row['decker']
 
-            framebase = row['filename'].replace('.fits','').replace('.fz','')
-            outfile = glob.glob(os.path.join(scidir, f'spec1d_{framebase}*.txt'))[0]
+            framebase = filename.replace('.fits','').replace('.fz','')
+            outfiles = glob.glob(os.path.join(scidir, f'spec1d_{framebase}*.txt'))
+
+            if len(outfiles)==0:
+                print(f'WARNING: no traces detected for {framebase}')
+                continue
+            else:
+                outfile = outfiles[0]
 
             spectable = ascii.read(outfile, delimiter='|', header_start=0)
 
             # Get the objects that are within tolerance of expected slit position
-            mask = np.abs(spectable['spat_pixpos']-slit_pos) < pix_tolerance
-            spectable = spectable[mask]
+            # Do this iteratively for different values of pix_tolerance
+            for pix_tol in pix_tolerance:
+                mask = np.abs(spectable['spat_pixpos']-slit_pos) < pix_tol
+                subtable = spectable[mask]
 
-            if len(spectable)==0:
-                print(f'WARNING: there is no good trace found in: {file}')
+                print(subtable,f'for slit_pos={slit_pos} and pix_tol={pix_tol}')
+
+                if len(subtable)==0:
+                    continue
+                else:
+                    break
+
+            if len(subtable)==0:
+                print(f'WARNING: could not find a good trace in: {filename}')
                 continue
 
             # Take the highest signal source at this position
-            idx = np.argmax(spectable['s2n'].data)
+            idx = np.argmax(subtable['s2n'].data)
 
-            objname = spectable[idx]['name']
+            objname = subtable[idx]['name']
             objdata.append((outfile, objname, target, mjd, dispname, slitname))
 
         elif row['frametype']=='standard':
