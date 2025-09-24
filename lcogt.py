@@ -21,9 +21,10 @@ import shutil
 import sys
 import copy
 import time
-import shibboleth
-from astropy.time import Time, TimeDelta
-from astropy.io import ascii, fits
+from astropy.time import Time
+from astropy.time import TimeDelta
+from astropy.io import ascii
+from astropy.io import fits
 from astropy.coordinates import SkyCoord
 from astropy import units as u
 from dateutil.parser import parse

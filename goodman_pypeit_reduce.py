@@ -43,6 +43,9 @@ def parse_arguments(usage=''):
 
     args = parser.parse_args()
 
+    # Parse output directory into an absolute path
+    args.outdir = os.path.abspath(args.outdir)
+
     return(args)
 
 
