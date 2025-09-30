@@ -43,6 +43,10 @@ def parse_arguments(usage=''):
                         help='Input date to download data.')
     parser.add_argument('outdir', type=str, default='.',
                         help='Base directory for pypeit reductions.')
+    parser.add_argument('--snid', default=False, action='store_true',
+                        help='Perform SNID SAGE classification.')
+    parser.add_argument('--slack', default=False, action='store_true',
+                        help='Push results to Slack with Slack API.')
 
     args = parser.parse_args()
 
@@ -263,9 +267,10 @@ def pypeit_post_process(objdata, specdir, caldb_dir):
     coadd_logname = os.path.join(dirname, 'coadd.log')
     par_outfile = os.path.join(dirname, 'coadd1d.par')
 
-    cmd = f'pypeit_coadd_1dspec {coadd_filename} --par_outfile {par_outfile} > {coadd_logname} 2> {coadd_logname}'
-    print(cmd)
-    os.system(cmd)
+    if not os.path.exists(out_1dfilename):
+        cmd = f'pypeit_coadd_1dspec {coadd_filename} --par_outfile {par_outfile} > {coadd_logname} 2> {coadd_logname}'
+        print(cmd)
+        os.system(cmd)
 
     if os.path.exists(fullout_1dfilename):
         tellcorr_logname = os.path.join(dirname, 'tellcorr.log')
@@ -273,9 +278,10 @@ def pypeit_post_process(objdata, specdir, caldb_dir):
 
         # Run telluric correction
         os.chdir(dirname)
-        cmd = f'pypeit_tellfit {fullout_1dfilename} --objmodel poly --par_outfile {par_outfile} > {tellcorr_logname} 2> {tellcorr_logname}'
-        print(cmd)
-        os.system(cmd)
+        if not os.path.exists(full_tellcorrfilename):
+            cmd = f'pypeit_tellfit {fullout_1dfilename} --objmodel poly --par_outfile {par_outfile} > {tellcorr_logname} 2> {tellcorr_logname}'
+            print(cmd)
+            os.system(cmd)
 
     if os.path.exists(full_tellcorrfilename):
         outlink = os.path.join(specdir, os.path.basename(full_tellcorrfilename))
@@ -287,7 +293,7 @@ def pypeit_post_process(objdata, specdir, caldb_dir):
             print(f'Linked {full_tellcorrfilename}->{outlink}')
             return(outlink)
 
-def main(date, outdir, caldb_dir):
+def main(date, outdir, caldb_dir, snid=False, slack=False):
     """
     Main driver script for the pypeit reduction pipeline.  Takes downloaded files
     from goodman_spec_download.py and processes them with pypeit to produce 
@@ -301,6 +307,7 @@ def main(date, outdir, caldb_dir):
     fulloutdir = os.path.join(outdir, datedir, 'rawdata')
     fullworkdir = os.path.join(outdir, datedir, 'workspace')
     fullspecdir = os.path.join(outdir, 'spectra')
+    fullslackdir = os.path.join(outdir, 'spectra', 'slack')
 
     # These should already exist from goodman_spec_download.py, if not then exit
     if not os.path.exists(fulloutdir) and not os.path.exists(fullworkdir):
@@ -310,6 +317,9 @@ def main(date, outdir, caldb_dir):
     # Make output spectrum directory if it does not exist
     if not os.path.exists(fullspecdir):
         os.makedirs(fullspecdir)
+
+    if not os.path.exists(fullslackdir):
+        os.makedirs(fullslackdir)
 
     # Create one reduction directory per object so they have the correct arc
     files = sorted(glob.glob(os.path.join(fulloutdir, '*.fz')))
@@ -438,34 +448,92 @@ def main(date, outdir, caldb_dir):
 
     for link in outlinks:
         if link and os.path.exists(link):
-            results = run_snid_sage(link)
-            print(results)
+            if snid: results = run_snid_sage(link)
+            if snid and slack: post_slack_results(link, results, fullslackdir)
+
+def post_slack_results(file_path, results, slackdir, channel='passta-classifications'):
+
+    dirname, basename = os.path.split(file_path)
+    slack_file = os.path.join(slackdir, basename.replace('.fits','.slack'))
+
+    if os.path.exists(slack_file):
+        print('Already posted to Slack...')
+        return(None)
+
+    hdu = fits.open(file_path)
+    datestr = Time(hdu['PRIMARY'].header['MJD'], format='mjd').datetime.strftime('%Y-%m-%dT%H:%M:%S')
+    mode = hdu['PRIMARY'].header['MODE']
+    objname = hdu['PRIMARY'].header['TARGET']
+    if 'results' in results.keys():
+        best_class = results['results'][0]['subtype']
+    else:
+        best_class = None
+
+    if 'SLACK_TOKEN_FILE_PASSTA' not in os.environ.keys():
+        raise Exception('SLACK_TOKEN_FILE_PASSTA needs to be an environment variable')
+    else:
+        client = slack_utils.setUpSlack(os.environ['SLACK_TOKEN_FILE_PASSTA'])
+
+    file_ids = [slack_utils.getFileUploadURL(client, file_path, channel)]
+    if 'plot' in results.keys():
+        file_ids.append(slack_utils.getFileUploadURL(client, results['plot'], channel))
+
+    message = f'*PASSTA Spectrum*: {objname} \n'
+    message += f'*Observation Time*: {datestr} \n'
+    message += f'*Mode*: {mode} \n'
+    message += f'*Best classification*: {best_class} \n'
+    # Format and add the first few rows of table
+    if 'results' in results.keys():
+        message += '*SNID SAGE Classifications:* \n'
+        form = '{name: <9} {typ: <4} {subtyp: <8} {redshift: <10} {age: <8}'
+        message += '```'
+        message += form.format(name='name', typ='type', subtyp='subtype', redshift='z', age='age')
+        message += '\n'
+        for i in range(3):
+            row = results['results'][i]
+            message += form.format(name=row['name'], typ=row['type'], 
+                subtyp=row['subtype'], redshift=row['redshift'], age=row['age'])
+            message += '\n'
+        message += '```'
+
+    with open(slack_file, 'w') as f:
+        f.write(message)
+
+    slack_utils.postSlackFiles(client, file_ids, message, channel)
 
 def run_snid_sage(filepath):
 
     dirpath, basename = os.path.split(filepath)
     results_dir = os.path.join(dirpath, 'results')
+    result_file = os.path.join(results_dir, basename.replace('.fits','.output'))
+    spec_plot = os.path.join(results_dir, basename.replace('.fits','_flattened_spectrum.png'))
+
     if not os.path.exists(results_dir):
         os.makedirs(results_dir)
 
     logpath = os.path.join(results_dir, basename.replace('.fits','.log'))
 
-    cmd = f'sage {filepath} -o {results_dir} > {logpath} 2> {logpath}'
-    print(cmd)
-    os.system(cmd)
+    if not os.path.exists(result_file):
+        cmd = f'sage {filepath} -o {results_dir} > {logpath} 2> {logpath}'
+        print(cmd)
+        os.system(cmd)
+
+    results = {}
 
     # Check if the output results file exists and parse it
-    result_file = os.path.join(results_dir, basename.replace('.fits','.output'))
     if os.path.exists(result_file):
         t = ascii.read(result_file, data_start=13, 
             names=('idx','name','type','subtype','rlap-ccc','redshift','error','age'))
-        return(t)
-    else:
-        return(None)
+        results['results']=t
+
+    if os.path.exists(spec_plot):
+        results['plot']=spec_plot
+
+    return(results)
 
 
 if __name__=="__main__":
     args = parse_arguments()
     file_dir, _ = os.path.split(__file__)
     caldb_dir = os.path.join(file_dir, 'caldb')
-    main(args.date, args.outdir, caldb_dir)
+    main(args.date, args.outdir, caldb_dir, snid=args.snid, slack=args.slack)
