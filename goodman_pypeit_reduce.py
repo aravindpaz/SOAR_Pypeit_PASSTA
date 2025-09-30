@@ -17,6 +17,9 @@ import copy
 import time
 import shutil
 
+# Internal dependency
+import slack_utils
+
 def refresh_astropy_cache():
 
     tries = 0
@@ -432,6 +435,33 @@ def main(date, outdir, caldb_dir):
     for objdata in all_objdata:
         scidir, _ = os.path.split(objdata[0][0])
         outlinks.append(pypeit_post_process(objdata, fullspecdir, caldb_dir))
+
+    for link in outlinks:
+        if link and os.path.exists(link):
+            results = run_snid_sage(link)
+            print(results)
+
+def run_snid_sage(filepath):
+
+    dirpath, basename = os.path.split(filepath)
+    results_dir = os.path.join(dirpath, 'results')
+    if not os.path.exists(results_dir):
+        os.makedirs(results_dir)
+
+    logpath = os.path.join(results_dir, basename.replace('.fits','.log'))
+
+    cmd = f'sage {filepath} -o {results_dir} > {logpath} 2> {logpath}'
+    print(cmd)
+    os.system(cmd)
+
+    # Check if the output results file exists and parse it
+    result_file = os.path.join(results_dir, basename.replace('.fits','.output'))
+    if os.path.exists(result_file):
+        t = ascii.read(result_file, data_start=13, 
+            names=('idx','name','type','subtype','rlap-ccc','redshift','error','age'))
+        return(t)
+    else:
+        return(None)
 
 
 if __name__=="__main__":
