@@ -522,8 +522,20 @@ def run_snid_sage(filepath):
 
     # Check if the output results file exists and parse it
     if os.path.exists(result_file):
-        t = ascii.read(result_file, data_start=13, 
-            names=('idx','name','type','subtype','rlap-ccc','redshift','error','age'))
+        data_start=False
+        all_data=[]
+        with open(result_file) as outf:
+            for line in outf:
+                if line.startswith('--------------------'):
+                    data_start=True
+                elif not data_start:
+                    continue
+                else:
+                    data = line.split()
+                    all_data.append(data)
+
+        all_data = [list(row) for row in zip(*all_data)]
+        t = Table(all_data, names=('idx','name','type','subtype','rlap-ccc','redshift','error','age'))
         results['results']=t
 
     if os.path.exists(spec_plot):
