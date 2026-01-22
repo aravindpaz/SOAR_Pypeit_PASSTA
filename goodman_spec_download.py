@@ -52,7 +52,7 @@ def main(date, propid, outdir='.'):
         telid='4m0a'
 
         obslist = lco.get_obslist(sdate=sdate, edate=edate,
-                propid=[propid], telid=telid, rlevel=[25],
+                propid=[propid], telid=telid, rlevel=[25,26],
                 obstype='SPECTRUM')
 
         # Dont know of any other way to distinguish raw from reduced files, so
@@ -68,7 +68,7 @@ def main(date, propid, outdir='.'):
 
         # Get any standard star calibration files
         callist = lco.get_obslist(sdate=sdate, edate=edate,
-            propid=['calibrate'], telid=telid, rlevel=[25],
+            propid=['calibrate'], telid=telid, rlevel=[25,26],
             obstype='SPECTRUM')
 
         instlist = []
@@ -85,7 +85,7 @@ def main(date, propid, outdir='.'):
 
         # Get associated calibration images
         flatlist = lco.get_obslist(sdate=sdate, edate=edate, telid=telid, 
-            propid=['calibrate'], rlevel=[25], obstype='LAMPFLAT')
+            propid=['calibrate'], rlevel=[25,26], obstype='LAMPFLAT')
 
         # Get associated arc lamp images
         arclist = []

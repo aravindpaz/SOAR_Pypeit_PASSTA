@@ -112,7 +112,11 @@ def parse_pypeit_output(scidir, pypeit_table, caldb, slit_pos=505, pix_tolerance
         elif row['frametype']=='standard':
 
             framebase = row['filename'].replace('.fits','').replace('.fz','')
-            outfile = glob.glob(os.path.join(scidir, f'spec1d_{framebase}*.fits'))[0]
+            spec1dfiles = glob.glob(os.path.join(scidir, f'spec1d_{framebase}*.fits'))
+            if len(spec1dfiles)==0:
+                continue
+
+            outfile = spec1dfiles[0]
 
             target = row['target'].lower()
             ra = row['ra']
@@ -336,7 +340,7 @@ def main(date, outdir, caldb_dir, snid=False, slack=False):
         hdu[1].header['OBJECT']=objname
         mjd = Time(hdu[1].header['DATE-OBS']).mjd
 
-        if hdu[1].header['INSTRUME']=='GHTS_BLUE':
+        if hdu[1].header['INSTRUME'].upper()=='GHTS_BLUE':
             spec = 'soar_goodman_blue'
 
         data = {'wavemod': wavemode, 'obstype': obstype, 'filename': file,
@@ -363,9 +367,8 @@ def main(date, outdir, caldb_dir, snid=False, slack=False):
 
         wavedata = all_data[wavemode]
         wavedata = sorted(wavedata, key=lambda x: x['mjd'])
-        arcdata = [d for d in wavedata if d['obstype']=='ARC']
-        all_objs = np.unique([d['object'] for d in wavedata if d['obstype']=='SPECTRUM'])
-
+        arcdata = [d for d in wavedata if d['obstype'] in ['ARC', 'COMP']]
+        all_objs = np.unique([d['object'] for d in wavedata if (d['obstype'] in ['SPECTRUM','OBJECT'] and d['object'].strip())])
 
         for objname in all_objs:
             objdir = os.path.join(wavedir, objname)
@@ -378,11 +381,11 @@ def main(date, outdir, caldb_dir, snid=False, slack=False):
                 basefile = os.path.basename(filename)
                 outfile = os.path.join(objdir, basefile)
 
-                if data['obstype']=='SPECTRUM':
+                if data['obstype'] in ['SPECTRUM','OBJECT']:
                     mjds.append(data['mjd'])
                     if data['object']!=objname: continue
                 # Will identify the best arc for this reduction after
-                if data['obstype']=='ARC': continue
+                if data['obstype'] in ['ARC','COMP']: continue
 
                 if not os.path.exists(outfile):
                     print(f'Linking {filename}->{outfile}')
@@ -522,8 +525,20 @@ def run_snid_sage(filepath):
 
     # Check if the output results file exists and parse it
     if os.path.exists(result_file):
-        t = ascii.read(result_file, data_start=13, 
-            names=('idx','name','type','subtype','rlap-ccc','redshift','error','age'))
+        data_start=False
+        all_data=[]
+        with open(result_file) as outf:
+            for line in outf:
+                if line.startswith('--------------------'):
+                    data_start=True
+                elif not data_start:
+                    continue
+                else:
+                    data = line.split()
+                    all_data.append(data)
+
+        all_data = [list(row) for row in zip(*all_data)]
+        t = Table(all_data, names=('idx','name','type','subtype','rlap-ccc','redshift','error','age'))
         results['results']=t
 
     if os.path.exists(spec_plot):
