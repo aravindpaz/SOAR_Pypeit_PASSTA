@@ -467,7 +467,7 @@ def post_slack_results(file_path, results, slackdir, channel='passta-classificat
     datestr = Time(hdu['PRIMARY'].header['MJD'], format='mjd').datetime.strftime('%Y-%m-%dT%H:%M:%S')
     mode = hdu['PRIMARY'].header['MODE']
     objname = hdu['PRIMARY'].header['TARGET']
-    if 'results' in results.keys():
+    if 'results' in results.keys() and results['results'] is not None:
         best_class = results['results'][0]['subtype']
     else:
         best_class = None
@@ -486,13 +486,16 @@ def post_slack_results(file_path, results, slackdir, channel='passta-classificat
     message += f'*Mode*: {mode} \n'
     message += f'*Best classification*: {best_class} \n'
     # Format and add the first few rows of table
-    if 'results' in results.keys():
+    if 'results' in results.keys() and results['results'] is not None:
         message += '*SNID SAGE Classifications:* \n'
         form = '{name: <9} {typ: <4} {subtyp: <8} {redshift: <10} {age: <8}'
         message += '```'
         message += form.format(name='name', typ='type', subtyp='subtype', redshift='z', age='age')
         message += '\n'
-        for i in range(3):
+
+        nresults = np.min([len(results['results']), 3])
+
+        for i in range(nresults):
             row = results['results'][i]
             message += form.format(name=row['name'], typ=row['type'], 
                 subtyp=row['subtype'], redshift=row['redshift'], age=row['age'])
@@ -521,7 +524,7 @@ def run_snid_sage(filepath):
         print(cmd)
         os.system(cmd)
 
-    results = {}
+    results = {'results': None, 'plot': None}
 
     # Check if the output results file exists and parse it
     if os.path.exists(result_file):
