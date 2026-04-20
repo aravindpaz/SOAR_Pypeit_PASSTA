@@ -1,0 +1,16 @@
+# Conda environment for PASSTA (SOAR/Goodman + PypeIt helpers).
+# From the repository root:
+#   conda env create -f environment.yml
+#   conda activate passta
+#
+# fpack / funpack are not bundled here; install separately if you use
+# goodman-file-organize or LCO paths that call funpack (see README).
+
+name: passta
+channels:
+  - conda-forge
+dependencies:
+  - python >=3.10,<3.14
+  - pip
+  - pip:
+    - -e .
