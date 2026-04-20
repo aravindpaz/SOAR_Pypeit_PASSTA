@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import astropy
+import contextlib
 import glob
 import logging
 import os
@@ -23,11 +24,22 @@ from astropy.time import Time
 from pypeit import inputfiles
 
 from passta import slack_utils
+from passta import pypeit_invoke
 from passta.logging_config import add_logging_arguments, configure_from_parsed_args
 from passta.lcogt import LCOGT
 from passta.versioning import add_version_argument
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _working_directory(path: str):
+    prev = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(prev)
 
 
 def _run_shell(cmd: str) -> None:
@@ -167,16 +179,12 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def _pypeit_setup_objdir(spec: str, objdir: str) -> None:
-    """Run ``pypeit_setup`` for one reduction directory (subprocess)."""
-    cmd = (
-        f'pypeit_setup -s {spec} -c all -r {objdir} -d {objdir} '
-        f'> {objdir}/setup.log 2> {objdir}/setup.log'
-    )
-    _run_shell(cmd)
+    """Run PypeIt setup for one reduction directory via :mod:`passta.pypeit_invoke`."""
+    pypeit_invoke.run_setup(spec, objdir, objdir)
 
 
 def _pypeit_reduce_objdir(spec: str, objdir: str, caldb_dir: str) -> list[tuple[Any, ...]]:
-    """Run ``run_pypeit`` if needed and return science rows from :func:`parse_pypeit_output`."""
+    """Run PypeIt reduction if needed and return science rows from :func:`parse_pypeit_output`."""
     pypeit_file = os.path.join(objdir, f'{spec}_A/{spec}_A.pypeit')
     science_dir = os.path.join(objdir, 'Science')
     if not os.path.exists(pypeit_file):
@@ -184,11 +192,7 @@ def _pypeit_reduce_objdir(spec: str, objdir: str, caldb_dir: str) -> list[tuple[
         return []
     pypeit_table = inputfiles.PypeItFile.from_file(pypeit_file)
     if not os.path.exists(science_dir):
-        cmd = (
-            f'run_pypeit {pypeit_file} -r {objdir} '
-            f'> {objdir}/reduction.log 2> {objdir}/reduction.log'
-        )
-        _run_shell(cmd)
+        pypeit_invoke.run_pypeit(pypeit_file, objdir)
     else:
         logger.info('Reduction already done for %s', objdir)
     return parse_pypeit_output(science_dir, pypeit_table, caldb_dir)
@@ -204,7 +208,7 @@ def parse_pypeit_output(
     """Inspect PypeIt ``Science`` products and build sensitivity functions.
 
     For each science row, selects the highest-S/N trace near ``slit_pos``. For
-    standards, runs ``pypeit_sensfunc`` and appends metadata to ``caldb.txt``.
+    standards, runs sensitivity-function generation via PypeIt and appends metadata to ``caldb.txt``.
 
     Parameters
     ----------
@@ -287,17 +291,12 @@ def parse_pypeit_output(
 
             sensfilename = f'{target}.{dispname}.{slitname}.{datestr}_sensfunc.fits'
             fullsensfilename = os.path.join(caldb, sensfilename)
-            senslog = os.path.join(scidir, sensfilename).replace('.fits', '.log')
             par_outfile = os.path.join(scidir, 'sensfunc.par')
 
             os.makedirs(caldb, exist_ok=True)
             os.makedirs(os.path.join(caldb, 'plots'), exist_ok=True)
 
-            cmd = (
-                f'pypeit_sensfunc {outfile} -o {fullsensfilename} '
-                f'--par_outfile {par_outfile} > {senslog} 2> {senslog}'
-            )
-            _run_shell(cmd)
+            pypeit_invoke.run_sensfunc(outfile, fullsensfilename, par_outfile)
 
             for file in glob.glob(os.path.join(caldb, '*.pdf')):
                 newfile = os.path.join(caldb, 'plots', os.path.basename(file))
@@ -440,39 +439,33 @@ def pypeit_post_process(
     fullsensfile = os.path.join(caldb_dir, goodcals[idx]['filename'])
 
     flux_filename = make_flux_file(objdata, fullsensfile)
-    flux_logname = os.path.join(dirname, 'flux.log')
+    flux_par_outfile = os.path.join(dirname, f'{target}.fluxing.par')
     if flux_filename is None:
         return None
 
-    _run_shell(
-        f'pypeit_flux_calib --par_outfile {flux_filename} > {flux_logname} 2> {flux_logname}'
-    )
+    pypeit_invoke.run_flux_calib(flux_filename, flux_par_outfile)
 
     out_1dfilename = f'{target}.{datestr}.{dispname}.coadd1d.fits'
     fullout_1dfilename = os.path.join(dirname, out_1dfilename)
     full_tellcorrfilename = fullout_1dfilename.replace('.fits', '_tellcorr.fits')
 
     coadd_filename = make_coadd_file(objdata, fullout_1dfilename)
-    coadd_logname = os.path.join(dirname, 'coadd.log')
     par_outfile = os.path.join(dirname, 'coadd1d.par')
     if coadd_filename is None:
         return None
 
     if not os.path.exists(fullout_1dfilename):
-        _run_shell(
-            f'pypeit_coadd_1dspec {coadd_filename} --par_outfile {par_outfile} '
-            f'> {coadd_logname} 2> {coadd_logname}'
-        )
+        pypeit_invoke.run_coadd_1dspec(coadd_filename, par_outfile)
 
     if os.path.exists(fullout_1dfilename):
-        tellcorr_logname = os.path.join(dirname, 'tellcorr.log')
-        par_outfile = os.path.join(dirname, 'tellfit.par')
-        os.chdir(dirname)
+        tell_par_outfile = os.path.join(dirname, 'tellfit.par')
         if not os.path.exists(full_tellcorrfilename):
-            _run_shell(
-                f'pypeit_tellfit {fullout_1dfilename} --objmodel poly '
-                f'--par_outfile {par_outfile} > {tellcorr_logname} 2> {tellcorr_logname}'
-            )
+            with _working_directory(dirname):
+                pypeit_invoke.run_tellfit(
+                    fullout_1dfilename,
+                    objmodel='poly',
+                    par_outfile=tell_par_outfile,
+                )
 
     if os.path.exists(full_tellcorrfilename):
         outlink = os.path.join(specdir, os.path.basename(full_tellcorrfilename))
@@ -641,7 +634,7 @@ def run_reduction(
     slack_dry_run: bool = False,
     parallel_jobs: int = 1,
 ) -> None:
-    """Main driver: symlink raw data, ``pypeit_setup`` / ``run_pypeit``, post-process.
+    """Main driver: symlink raw data, run PypeIt setup and reduction in-process, post-process.
 
     Parameters
     ----------
