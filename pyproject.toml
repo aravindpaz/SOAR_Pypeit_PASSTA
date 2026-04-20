@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "passta"
+dynamic = ["version"]
+description = "PASSTA SOAR/Goodman spectroscopy helpers: LCO archive download, PypeIt reduction, optional SNID/Slack."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "C. D. Kilpatrick" }]
+license = { text = "MIT" }
+keywords = ["astronomy", "spectroscopy", "SOAR", "Goodman", "PypeIt", "PASSTA"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Astronomy",
+]
+dependencies = [
+  "astropy>=7.2.0",
+  "numpy>=2.4.1",
+  "requests>=2.28",
+  "python-dateutil>=2.8",
+  "slack-sdk>=3.21",
+  "pypeit>=1.14.0",
+]
+
+[project.urls]
+Documentation = "https://github.com/charliekilpatrick/soar_pypeit_example"
+
+[project.scripts]
+goodman-spec-download = "passta.spec_download:main"
+goodman-pypeit-reduce = "passta.pypeit_reduce:main"
+goodman-file-organize = "passta.file_organize:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["passta*"]
+
+[tool.setuptools.package-data]
+passta = ["caldb/*.txt", "caldb/*.fits"]
+
+[tool.setuptools_scm]
+version_file = "passta/_version.py"
+fallback_version = "0.1.0"
