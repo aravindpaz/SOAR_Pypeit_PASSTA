@@ -62,6 +62,25 @@ def _archive_download_to_path(url: str, dest_path: str, max_tries: int, verbose:
             logger.error('Failed to download: %s', dest_path)
 
 
+# LCO archive RLEVEL codes for Goodman spectroscopy (2026 scheme).
+# https://github.com/aravindpaz/SOAR_Pypeit_PASSTA/issues/3
+LCO_RLEVEL_RAW = 0
+LCO_RLEVEL_LEGACY_REDUCED = (25, 26)  # interim pipeline levels before the 2026 scheme
+LCO_RLEVEL_CFZST = 62  # reduced (bias, flat, trim, cosmic)
+LCO_RLEVEL_ECFZST = 63  # extracted 1D spectrum
+LCO_RLEVEL_WECFZST = 64  # wavelength calibrated
+
+# Query all levels that may appear for science / lamp flats; callers should drop
+# pipeline products (cfzst / ecfzst / wecfzst basename prefixes) before download.
+LCO_RLEVEL_SPECTROSCOPY = (
+    LCO_RLEVEL_RAW,
+    *LCO_RLEVEL_LEGACY_REDUCED,
+    LCO_RLEVEL_CFZST,
+    LCO_RLEVEL_ECFZST,
+    LCO_RLEVEL_WECFZST,
+)
+
+
 class LCOGT:
     """Client for LCO archive queries, downloads, and observation requests."""
 
@@ -432,13 +451,18 @@ class LCOGT:
     @staticmethod
     def _frame_row_matches(row, telid, obstype, rlevel):
         """Return True if an archive frame row passes telid/obstype/rlevel filters."""
-        if telid is not None and row['TELID'] not in telid:
-            return False
+        if telid is not None:
+            if isinstance(telid, (str, bytes)):
+                telids = (telid,)
+            else:
+                telids = telid
+            if row['TELID'] not in telids:
+                return False
         if obstype is not None and row['configuration_type'] != obstype:
             return False
         if rlevel is None:
             return True
-        if isinstance(rlevel, list):
+        if isinstance(rlevel, (list, tuple)):
             return row['RLEVEL'] in rlevel
         return row['RLEVEL'] == rlevel
 
@@ -688,6 +712,30 @@ class LCOGT:
 
         return target
 
+    @staticmethod
+    def _goodman_wavmode_from_fits(path: str) -> str | None:
+        """Read ``WAVMODE`` from a Goodman fpacked or uncompressed FITS path."""
+        from astropy.io import fits
+
+        try:
+            with fits.open(path) as hdul:
+                pl = path.lower()
+                prefer = (1, 0) if pl.endswith('.fz') or pl.endswith('.fits.fz') else (0, 1)
+                for i in prefer:
+                    if 0 <= i < len(hdul) and 'WAVMODE' in hdul[i].header:
+                        val = str(hdul[i].header['WAVMODE']).strip()
+                        if val:
+                            return val.replace(' ', '_')
+                for i in range(len(hdul)):
+                    hdr = hdul[i].header
+                    if 'WAVMODE' in hdr:
+                        val = str(hdr['WAVMODE']).strip()
+                        if val:
+                            return val.replace(' ', '_')
+        except OSError:
+            return None
+        return None
+
     def _process_obslist_frame(
         self,
         frame,
@@ -698,8 +746,12 @@ class LCOGT:
         force_objname,
         verbose,
         max_tries,
+        *,
+        embed_wavmode: bool = False,
     ):
         """Download, funpack, and optionally trim headers for one archive frame."""
+        idnum = str(frame['id'])
+        date = Time(frame['DATE_OBS']).datetime.strftime('ut%y%m%d')
         filename = ''
         if use_basename:
             filename = frame['basename'] + '.fits.fz'
@@ -713,16 +765,15 @@ class LCOGT:
             if not target:
                 target = 'field' + str(frame['id'])
 
-            filt = frame['FILTER']
-            idnum = str(frame['id'])
-            date = Time(frame['DATE_OBS']).datetime.strftime('ut%y%m%d')
+            filt = frame.get('FILTER')
+            filt_l = str(filt).lower() if filt is not None else ''
 
-            if filt.lower() in ['opaque']:
+            if filt_l == 'opaque':
                 return
-            if filt.lower() == 'no_filter':
+            if embed_wavmode or filt_l in ('', 'no_filter'):
                 filename = f'{target}.{date}.{idnum}.fits.fz'
             else:
-                filename = f'{target}.{date}.{filt}.{idnum}.fits.fz'
+                filename = f'{target}.{date}.{filt_l}.{idnum}.fits.fz'
 
         fullfilename = os.path.join(outrootdir, filename)
         unpacked = fullfilename.removesuffix('.fz')
@@ -747,6 +798,21 @@ class LCOGT:
             logger.info('LCOGT file: %s already exists!', fullfilename)
             file_exists = True
 
+        if embed_wavmode and os.path.exists(fullfilename):
+            wavmode = self._goodman_wavmode_from_fits(fullfilename)
+            if wavmode:
+                wavname = f'{target}.{date}.{wavmode}.{idnum}.fits.fz'
+                wavpath = os.path.join(outrootdir, wavname)
+                if wavpath != fullfilename:
+                    if os.path.exists(wavpath):
+                        os.remove(fullfilename)
+                        fullfilename = wavpath
+                    else:
+                        os.replace(fullfilename, wavpath)
+                        fullfilename = wavpath
+            else:
+                logger.warning('No WAVMODE in %s; keeping provisional filename', fullfilename)
+
         if not os.path.exists(unpacked) and funpack:
             cmd = 'funpack {file}'
             os.system(cmd.format(file=fullfilename))
@@ -764,7 +830,7 @@ class LCOGT:
 
     def download_obslist(self, obslist, outrootdir='', use_basename=False,
         skip_header=False, funpack=True, force_objname='', verbose=False,
-        max_tries=4, max_download_workers=1):
+        max_tries=4, max_download_workers=1, embed_wavmode: bool = False):
         """Download archive frames to disk, optionally funpack and trim headers.
 
         Parameters
@@ -789,10 +855,14 @@ class LCOGT:
             If greater than 1, process frames concurrently (I/O bound HTTP downloads).
             ``funpack`` / FITS post-processing still run inside each worker thread;
             use modest values (for example 4--8) to avoid throttling by the archive.
+        embed_wavmode : bool, optional
+            If True, after download read Goodman ``WAVMODE`` from the FITS header and
+            rename to ``{target}.{utdate}.{WAVMODE}.{id}.fits.fz``.
         """
         if not obslist:
             return
         os.makedirs(outrootdir, exist_ok=True)
+        logger.info('Downloading %s LCO frame(s) to %s', len(obslist), outrootdir)
 
         def _one(frame):
             return self._process_obslist_frame(
@@ -804,6 +874,7 @@ class LCOGT:
                 force_objname,
                 verbose,
                 max_tries,
+                embed_wavmode=embed_wavmode,
             )
 
         if max_download_workers <= 1:

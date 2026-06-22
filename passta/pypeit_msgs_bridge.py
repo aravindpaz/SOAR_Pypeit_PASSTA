@@ -1,4 +1,9 @@
-"""Route PypeIt's ``msgs`` output into the standard :mod:`logging` tree (PASSTA log)."""
+"""Route PypeIt user-facing output into the standard :mod:`logging` tree (PASSTA log).
+
+Older PypeIt exposes a process-global :obj:`pypeit.msgs` (:class:`~pypeit.pypmsgs.Messages`).
+Current releases use :obj:`pypeit.log` (:class:`~pypeit.logger.PypeItLogger`) instead; this
+module supports both.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +11,9 @@ import contextlib
 import contextvars
 import io
 import logging
+import sys
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Callable
 
 # Active bridge target; ``None`` means PypeIt uses its default ``msgs`` behaviour.
@@ -110,9 +117,96 @@ def _patched_messages_reset(
 
 _msgs_reset_patch_installed = False
 
+_original_pypeitlogger_init: Callable[..., None] | None = None
+_pypeitlogger_init_patch_installed = False
+
+
+def _legacy_pypeit_msgs_available(pypeit_mod: object) -> bool:
+    msgs = getattr(pypeit_mod, 'msgs', None)
+    return msgs is not None and getattr(msgs, 'reset', None) is not None
+
+
+def _install_pypeit_log_init_patch() -> None:
+    """Patch :meth:`pypeit.logger.PypeItLogger.init` so an active bridge steers the stream.
+
+    PypeIt scripts call :meth:`pypeit.scripts.scriptbase.ScriptBase.init_log`, which
+    reconfigures the ``pypeit`` logger and would otherwise replace any stream we set
+    at bridge entry.
+    """
+    global _original_pypeitlogger_init, _pypeitlogger_init_patch_installed
+    if _pypeitlogger_init_patch_installed:
+        return
+    from pypeit.logger import PypeItLogger
+
+    _original_pypeitlogger_init = PypeItLogger.init
+
+    def _patched_init(  # noqa: ANN001
+        self,
+        level: int = logging.INFO,
+        stream: io.TextIOBase | None = None,
+        log_file: str | Path | None = None,
+        log_file_level: int | None = None,
+    ) -> None:
+        assert _original_pypeitlogger_init is not None
+        target = _bridge_logger.get()
+        if target is not None:
+            stream = _MsgsLoggerWriter(target)
+            log_file = None
+            log_file_level = None
+        return _original_pypeitlogger_init(
+            self,
+            level=level,
+            stream=stream,
+            log_file=log_file,
+            log_file_level=log_file_level,
+        )
+
+    PypeItLogger.init = _patched_init  # type: ignore[method-assign]
+    _pypeitlogger_init_patch_installed = True
+
+
+def _pypeit_console_level() -> int:
+    """Match legacy bridge (verbosity=1): INFO on the PypeIt console stream."""
+    from pypeit import log as pypeit_log
+
+    return pypeit_log.convert_verbosity_to_logging_level(1)
+
+
+def _apply_modern_pypeit_log_sink(log: logging.Logger) -> None:
+    from pypeit import log as pypeit_log
+
+    pypeit_log.init(
+        level=_pypeit_console_level(),
+        stream=_MsgsLoggerWriter(log),
+        log_file=None,
+    )
+
+
+def _restore_modern_pypeit_log_default() -> None:
+    from pypeit import log as pypeit_log
+
+    pypeit_log.init(level=logging.DEBUG, stream=sys.stderr, log_file=None)
+
+
+def _ensure_pypeit_user() -> None:
+    """Define ``pypeit.pypeit_user`` if missing (needed before ``pypeit.pypmsgs`` imports).
+
+    Recent PypeIt releases dropped ``pypeit_user`` from :file:`pypeit/__init__.py`, but
+    ``pypmsgs.py`` still does ``from pypeit import pypeit_user``, which breaks
+    ``from pypeit.pypmsgs import Messages`` on some pip/conda installs. Match the
+    historical behaviour (see upstream ``pypeit`` package init on older tags).
+    """
+    import getpass
+
+    import pypeit
+
+    if not hasattr(pypeit, 'pypeit_user'):
+        pypeit.pypeit_user = getpass.getuser()
+
 
 def _install_msgs_reset_patch() -> None:
     global _original_messages_reset, _msgs_reset_patch_installed
+    _ensure_pypeit_user()
     from pypeit.pypmsgs import Messages
 
     if _msgs_reset_patch_installed:
@@ -125,16 +219,20 @@ def _install_msgs_reset_patch() -> None:
 def _restore_default_msgs() -> None:
     import pypeit
 
+    if not _legacy_pypeit_msgs_available(pypeit):
+        _restore_modern_pypeit_log_default()
+        return
     pypeit.msgs.reset(log=None, verbosity=1, log_to_stderr=True, colors=False)
 
 
 @contextlib.contextmanager
 def pypeit_logging_bridge(log: logging.Logger | None = None) -> Iterator[None]:
-    """While active, all ``pypeit.msgs.reset(...)`` calls route to ``log``.
+    """While active, PypeIt script output is routed to ``log``.
 
-    PypeIt scripts and ``PypeIt`` call ``msgs.reset`` with a log file path or
-    ``None``; under this context, those calls are redirected to the given
-    logger instead (no separate PypeIt log files from PASSTA).
+    Legacy PypeIt uses ``pypeit.msgs``; current releases use ``pypeit.log``
+    (:class:`~pypeit.logger.PypeItLogger`). Under this context, console output
+    is redirected to the given logger (and separate PypeIt log files are
+    suppressed while the bridge is active).
 
     Parameters
     ----------
@@ -143,28 +241,35 @@ def pypeit_logging_bridge(log: logging.Logger | None = None) -> Iterator[None]:
 
     Notes
     -----
-    ``pypeit.msgs`` is process-global. Nested ``with pypeit_logging_bridge()``
-    blocks are supported. When the outermost block ends and no bridge remains
-    active, ``msgs`` is reset to PypeIt defaults.
+    The legacy ``msgs`` object and the modern ``pypeit`` named logger are
+    process-global. Nested ``with pypeit_logging_bridge()`` blocks are
+    supported. When the outermost block ends, sinks are reset to PypeIt
+    defaults.
 
     Parallel threads each running PypeIt with different bridge targets can race
-    on the shared ``msgs`` object; keep ``--jobs 1`` if you see interleaved
-    output, or share one logger for all workers.
+    on the shared logger; keep ``--jobs 1`` if you see interleaved output, or
+    share one logger for all workers.
     """
-    _install_msgs_reset_patch()
+    _install_pypeit_log_init_patch()
     lg = log or logging.getLogger('passta')
     token = _bridge_logger.set(lg)
     import pypeit
 
-    # Apply the bridge immediately; otherwise ``msgs`` keeps prior sinks until
-    # the next ``reset`` call inside PypeIt.
-    pypeit.msgs.reset(log=None, verbosity=1, log_to_stderr=True, colors=False)
+    legacy = _legacy_pypeit_msgs_available(pypeit)
+    if legacy:
+        _install_msgs_reset_patch()
+        pypeit.msgs.reset(log=None, verbosity=1, log_to_stderr=True, colors=False)
+    else:
+        # Modern PypeIt: ``PypeItLogger.init`` is patched so ``init_log`` keeps this sink.
+        _apply_modern_pypeit_log_sink(lg)
     try:
         yield
     finally:
         _bridge_logger.reset(token)
-        if _bridge_logger.get() is None:
+        parent = _bridge_logger.get()
+        if parent is None:
             _restore_default_msgs()
-        else:
-            # Outer bridge still active: re-apply its sink after this inner exit.
+        elif legacy:
             pypeit.msgs.reset(log=None, verbosity=1, log_to_stderr=True, colors=False)
+        else:
+            _apply_modern_pypeit_log_sink(parent)

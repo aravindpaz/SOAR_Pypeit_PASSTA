@@ -3,11 +3,216 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import copy
 import logging
+import shlex
+from collections.abc import Callable, Iterator
+from importlib import resources
+from pathlib import Path
+from typing import Any
 
 from passta.pypeit_msgs_bridge import pypeit_logging_bridge
 
 logger = logging.getLogger(__name__)
+
+_GOODMAN_SPEC_PREFIX = 'soar_goodman'
+
+
+def goodman_flatfield_param_file() -> str | None:
+    """Path to packaged Goodman flat-field PypeIt parameter block, if present."""
+    try:
+        path = resources.files('passta').joinpath('config/goodman_flatfield.par')
+        if path.is_file():
+            return str(path)
+    except (ModuleNotFoundError, TypeError, FileNotFoundError):
+        pass
+    fallback = Path(__file__).resolve().parent / 'config' / 'goodman_flatfield.par'
+    return str(fallback) if fallback.is_file() else None
+
+
+def _goodman_detector_data_hdu_index(hdu: Any) -> int:
+    """Index of the HDU that carries Goodman ``GAIN`` / science header (0 or 1).
+
+    PypeIt's Goodman classes assume ``hdu[1]`` (typical fpacked layout). Single-HDU
+    archive ``.fits`` only have ``hdu[0]``, which caused ``IndexError`` in
+    ``get_detector_par`` during reduction (e.g. ``bpm`` → ``get_rawimage``).
+    """
+    if hdu is None or len(hdu) == 0:
+        return 0
+    if len(hdu) == 1:
+        return 0
+    try:
+        hdr1 = hdu[1].header
+        if 'GAIN' in hdr1:
+            return 1
+    except (IndexError, KeyError, AttributeError):
+        pass
+    for i in range(len(hdu)):
+        hdr = getattr(hdu[i], 'header', None)
+        if hdr is not None and 'GAIN' in hdr:
+            return i
+    return 0
+
+
+def _passta_goodman_red_get_detector_par(self, det: int, hdu: Any = None) -> Any:  # noqa: ANN401
+    """``SOARGoodmanRedSpectrograph.get_detector_par`` with correct HDU index for single-ext .fits."""
+    import numpy as np
+
+    from pypeit import PypeItError
+    from pypeit.images import detector_container
+
+    if hdu is None:
+        binning = '2,2'
+        gain = None
+        ronoise = None
+        datasec = None
+        oscansec = None
+        edx = 1
+    else:
+        edx = _goodman_detector_data_hdu_index(hdu)
+        hdr = hdu[edx].header
+        binning = self.get_meta_value(self.get_headarr(hdu), 'binning')
+        gain = np.atleast_1d(hdr['GAIN'])
+        ronoise = np.atleast_1d(hdr['RDNOISE'])
+        datasec = None
+        oscansec = None
+
+    detector_dict = dict(
+        binning=binning,
+        det=1,
+        dataext=edx,
+        specaxis=1,
+        specflip=False,
+        spatflip=False,
+        platescale=0.15,
+        darkcurr=0.0,
+        saturation=65535.0,
+        nonlinear=1.0,
+        mincounts=-1e10,
+        numamplifiers=1,
+        gain=gain,
+        ronoise=ronoise,
+        datasec=datasec,
+        oscansec=oscansec,
+    )
+
+    if hdu is None:
+        return detector_container.DetectorContainer(**detector_dict)
+
+    hdr = hdu[edx].header
+    if binning != '2,2':
+        raise PypeItError('Ask the developers to add your binning.  Or add it yourself.')
+    col0 = int(hdr['TRIMSEC'][1:].split(':')[0])
+    detector_dict['datasec'] = np.atleast_1d(f'[:,{col0 * 2}:]')
+    detector_dict['oscansec'] = np.atleast_1d(f'[:,1:{int(col0 * 2) - 2}:]')
+    return detector_container.DetectorContainer(**detector_dict)
+
+
+def _passta_goodman_blue_get_detector_par(self, det: int, hdu: Any = None) -> Any:  # noqa: ANN401
+    """``SOARGoodmanBlueSpectrograph.get_detector_par`` with correct HDU index for single-ext .fits."""
+    import numpy as np
+
+    from pypeit.images import detector_container
+
+    if hdu is None:
+        binning = '2,2'
+        gain = None
+        ronoise = None
+        datasec = None
+        oscansec = None
+        edx = 1
+    else:
+        edx = _goodman_detector_data_hdu_index(hdu)
+        hdr = hdu[edx].header
+        binning = self.get_meta_value(self.get_headarr(hdu), 'binning')
+        gain = np.atleast_1d(hdr['GAIN'])
+        ronoise = np.atleast_1d(hdr['RDNOISE'])
+        datasec = None
+        oscansec = None
+
+    detector_dict = dict(
+        binning=binning,
+        det=1,
+        dataext=edx,
+        specaxis=1,
+        specflip=False,
+        spatflip=False,
+        platescale=0.15,
+        darkcurr=0.0,
+        saturation=65535.0,
+        nonlinear=1.0,
+        mincounts=-1e10,
+        numamplifiers=1,
+        gain=gain,
+        ronoise=ronoise,
+        datasec=np.asarray(['[:,20:4112]']),
+        oscansec=np.asarray(['[:,2:16]']),
+    )
+
+    if hdu is None:
+        return detector_container.DetectorContainer(**detector_dict)
+    return detector_container.DetectorContainer(**detector_dict)
+
+
+@contextlib.contextmanager
+def goodman_raw_fits_runtime(spectrograph: str, extension: str | None) -> Iterator[None]:
+    """Compatibility for SOAR/Goodman raw ``.fits`` for setup **and** reduction.
+
+    Upstream :class:`~pypeit.spectrographs.soar_goodman.SOARGoodmanSpectrograph`
+    sets ``allowed_extensions = ['.fz']`` only. That breaks ``pypeit_setup`` with
+    ``-e .fits`` and later :class:`~pypeit.pypeit.PypeIt` (``_check_extensions`` on
+    raw paths listed in the ``.pypeit`` file). PASSTA widens ``allowed_extensions``
+    for ``.fits`` / ``None`` for the whole time this context is active.
+
+    Uncompressed Goodman frames are often single-HDU while ``meta`` uses
+    ``ext=1`` (matching fpacked ``.fz``). We duplicate the primary header in
+    :meth:`~pypeit.spectrographs.spectrograph.Spectrograph.get_headarr` when only
+    one extension is present so setup metadata matches PypeIt expectations.
+
+    Reduction assumes ``hdu[1]`` in ``get_detector_par``; PASSTA patches Red/Blue
+    ``get_detector_par`` to use the HDU that actually contains ``GAIN`` and sets
+    ``dataext`` accordingly so ``get_rawimage`` / BPM construction work on
+    single-extension ``.fits``.
+    """
+    if not spectrograph.startswith(_GOODMAN_SPEC_PREFIX):
+        yield
+        return
+    if extension not in ('.fits', None):
+        yield
+        return
+    from pypeit.spectrographs.soar_goodman import (
+        SOARGoodmanBlueSpectrograph,
+        SOARGoodmanRedSpectrograph,
+        SOARGoodmanSpectrograph,
+    )
+
+    orig_ext = list(SOARGoodmanSpectrograph.allowed_extensions)
+    orig_get_headarr: Callable[..., Any] = SOARGoodmanSpectrograph.get_headarr
+    orig_red_gdp: Callable[..., Any] = SOARGoodmanRedSpectrograph.get_detector_par
+    orig_blue_gdp: Callable[..., Any] = SOARGoodmanBlueSpectrograph.get_detector_par
+
+    def _patched_get_headarr(self, inp, strict=True):  # noqa: ANN001
+        headers = orig_get_headarr(self, inp, strict=strict)
+        if headers is not None and len(headers) == 1:
+            return [headers[0], copy.deepcopy(headers[0])]
+        return headers
+
+    patched = False
+    if '.fits' not in orig_ext:
+        SOARGoodmanSpectrograph.allowed_extensions = list(dict.fromkeys([*orig_ext, '.fits']))
+        patched = True
+    SOARGoodmanSpectrograph.get_headarr = _patched_get_headarr  # type: ignore[method-assign]
+    SOARGoodmanRedSpectrograph.get_detector_par = _passta_goodman_red_get_detector_par  # type: ignore[method-assign]
+    SOARGoodmanBlueSpectrograph.get_detector_par = _passta_goodman_blue_get_detector_par  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        SOARGoodmanSpectrograph.get_headarr = orig_get_headarr  # type: ignore[method-assign]
+        SOARGoodmanRedSpectrograph.get_detector_par = orig_red_gdp  # type: ignore[method-assign]
+        SOARGoodmanBlueSpectrograph.get_detector_par = orig_blue_gdp  # type: ignore[method-assign]
+        if patched:
+            SOARGoodmanSpectrograph.allowed_extensions = orig_ext
 
 
 def pypeit_verbosity() -> int:
@@ -20,35 +225,75 @@ def pypeit_verbosity() -> int:
     return 0
 
 
+def _log_pypeit_cli(name: str, *argv: str) -> None:
+    """Log the shell-equivalent PypeIt command (in-process invocation uses the same args)."""
+    cmd = ' '.join([name, *(shlex.quote(a) for a in argv)])
+    logger.info('PypeIt equivalent command: %s', cmd)
+
+
 def run_setup(
     spectrograph: str,
     root: str,
     output_path: str,
+    *,
+    extension: str = '.fits',
 ) -> None:
     """Run :class:`pypeit.scripts.setup.Setup` (``pypeit_setup``).
 
     Mirrors ``pypeit_setup -s <spec> -c all -r <root> -d <output_path>`` with
     defaults aligned to PASSTA's prior shell invocation. PypeIt ``msgs`` are
     routed through :func:`passta.pypeit_msgs_bridge.pypeit_logging_bridge`.
+
+    Parameters
+    ----------
+    extension : str, optional
+        Filename suffix for frames under ``root`` (e.g. ``.fits`` or ``.fz``).
+        For SOAR/Goodman raw ``.fits``, use :func:`goodman_raw_fits_runtime` in
+        :func:`passta.pypeit_reduce.run_reduction` so setup and ``run_pypeit`` share
+        the same compatibility window.
     """
     from pypeit.scripts.setup import Setup
+
+    param_block_file = None
+    if spectrograph.startswith(_GOODMAN_SPEC_PREFIX):
+        param_block_file = goodman_flatfield_param_file()
+        if param_block_file:
+            logger.info('PypeIt flat-field param block %s', param_block_file)
 
     args = argparse.Namespace(
         spectrograph=spectrograph,
         root=[root],
-        extension='.fits',
+        extension=extension,
         output_path=output_path,
         overwrite=False,
         cfg_split='all',
         background=False,
         manual_extraction=False,
+        flexure=False,
         keep_bad_frames=False,
         gui=False,
         version_override=None,
         date_override=None,
+        param_block_file=param_block_file,
         verbosity=pypeit_verbosity(),
+        log_file=None,
+        log_level=None,
     )
-    logger.info('PypeIt setup: spectrograph=%s root=%s output=%s', spectrograph, root, output_path)
+    setup_argv = [
+        '-s',
+        spectrograph,
+        '-c',
+        'all',
+        '-r',
+        root,
+        '-d',
+        output_path,
+        '-e',
+        extension,
+    ]
+    if param_block_file:
+        setup_argv.extend(['--param_block_file', param_block_file])
+    _log_pypeit_cli('pypeit_setup', *setup_argv)
     with pypeit_logging_bridge(logger):
         Setup.main(args)
 
@@ -68,8 +313,10 @@ def run_pypeit(
         show=False,
         overwrite=False,
         calib_only=False,
+        log_file=None,
+        log_level=None,
     )
-    logger.info('PypeIt reduce: file=%s redux_path=%s', pypeit_file, redux_path)
+    _log_pypeit_cli('run_pypeit', pypeit_file, '-r', redux_path)
     with pypeit_logging_bridge(logger):
         RunPypeIt.main(args)
 
@@ -82,18 +329,25 @@ def run_sensfunc(
     """Run :class:`pypeit.scripts.sensfunc.SensFunc` (``pypeit_sensfunc``)."""
     from pypeit.scripts.sensfunc import SensFunc
 
+    # Match ``pypeit.scripts.sensfunc.SensFunc.get_parser`` (API drift: ``use_flat``, ``extr``, ``spec1dfiles``).
     args = argparse.Namespace(
-        spec1dfile=spec1d_fits,
+        spec1dfiles=[spec1d_fits],
         outfile=outfile,
         par_outfile=par_outfile,
         algorithm=None,
         multi=None,
         sens_file=None,
-        flatfile=None,
+        use_flat=False,
+        extr=None,
         debug=False,
         verbosity=pypeit_verbosity(),
+        log_file=None,
+        log_level=None,
     )
-    logger.info('PypeIt sensfunc: in=%s out=%s', spec1d_fits, outfile)
+    sens_argv = [spec1d_fits, '-o', outfile, '--par_outfile', par_outfile]
+    if args.use_flat:
+        sens_argv.append('--use_flat')
+    _log_pypeit_cli('pypeit_sensfunc', *sens_argv)
     with pypeit_logging_bridge(logger):
         SensFunc.main(args)
 
@@ -102,7 +356,7 @@ def run_flux_calib(
     flux_file: str,
     par_outfile: str,
     *,
-    try_old: bool = False,
+    try_old: bool = True,
 ) -> None:
     """Run :class:`pypeit.scripts.flux_calib.FluxCalib` (``pypeit_flux_calib``)."""
     from pypeit.scripts.flux_calib import FluxCalib
@@ -112,8 +366,13 @@ def run_flux_calib(
         par_outfile=par_outfile,
         try_old=try_old,
         verbosity=pypeit_verbosity(),
+        log_file=None,
+        log_level=None,
     )
-    logger.info('PypeIt flux_calib: flux_file=%s par_out=%s', flux_file, par_outfile)
+    flux_argv = [flux_file, '--par_outfile', par_outfile]
+    if try_old:
+        flux_argv.append('--try_old')
+    _log_pypeit_cli('pypeit_flux_calib', *flux_argv)
     with pypeit_logging_bridge(logger):
         FluxCalib.main(args)
 
@@ -131,8 +390,10 @@ def run_coadd_1dspec(
         debug=False,
         show=False,
         verbosity=pypeit_verbosity(),
+        log_file=None,
+        log_level=None,
     )
-    logger.info('PypeIt coadd_1dspec: %s', coadd1d_file)
+    _log_pypeit_cli('pypeit_coadd_1dspec', coadd1d_file, '--par_outfile', par_outfile)
     with pypeit_logging_bridge(logger):
         CoAdd1DSpec.main(args)
 
@@ -159,7 +420,12 @@ def run_tellfit(
         par_outfile=par_outfile,
         chk_version=chk_version,
         verbosity=pypeit_verbosity(),
+        log_file=None,
+        log_level=None,
     )
-    logger.info('PypeIt tellfit: %s objmodel=%s', spec1d_or_coadd, objmodel)
+    tell_argv = [spec1d_or_coadd, '--objmodel', objmodel, '--par_outfile', par_outfile]
+    if chk_version:
+        tell_argv.append('--chk_version')
+    _log_pypeit_cli('pypeit_tellfit', *tell_argv)
     with pypeit_logging_bridge(logger):
         TellFit.main(args)

@@ -20,7 +20,7 @@ This repository is a companion to general SOAR/PypeIt examples such as [soar_pyp
   - **CFITSIO** `fpack` / `funpack` (file organize / some LCO downloads)
   - **PypeIt** CLIs: `pypeit_setup`, `run_pypeit`, `pypeit_sensfunc`, `pypeit_flux_calib`, `pypeit_coadd_1dspec`, `pypeit_tellfit`
   - Optional: if **`pypeit_tellfit`** times out fetching PCA telluric data from object storage, run **`scripts/install_telluric_pca_from_gdrive.sh`** (after `conda activate …`) to pull **`TellPCA_3000_26000_R15000.fits`** from the PypeIt Telluric [Google Drive](https://drive.google.com/drive/folders/1FFRWjUZ58HiDuDD33MYqBzMWDQanBRRy), **`pypeit_install_telluric --local_file`** it into the cache, then remove the download under **`WORKDIR`** (default repo root) so only the cached copy remains.
-  - Optional: **`sage`** (SNID SAGE) for `--snid`
+  - **`snid-sage`** (declared in ``pyproject.toml``): supplies the ``sage`` CLI used for ``--snid`` (distinct from **SageMath**’s ``sage``; use a dedicated env if both are installed)
   - Optional: **Slack** bot token file for `--slack` (see below)
 
 ## Installation

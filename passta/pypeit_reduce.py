@@ -8,6 +8,7 @@ import contextlib
 import glob
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -27,9 +28,91 @@ from passta import slack_utils
 from passta import pypeit_invoke
 from passta.logging_config import add_logging_arguments, configure_from_parsed_args
 from passta.lcogt import LCOGT
+from passta.spec_download import GDRIVE_NIGHT_LABEL_FILE, _pick_datedir_from_filenames
 from passta.versioning import add_version_argument
 
 logger = logging.getLogger(__name__)
+
+_YMD_DIR_RE = re.compile(r'^\d{8}$')
+
+
+def _ymd_dir_to_date_arg(ymd: str) -> str:
+    """``YYYYMMDD`` directory name -> ISO date string for :class:`~astropy.time.Time`."""
+    return f'{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}'
+
+
+def discover_to_os_reduction_jobs(base_dir: str) -> list[tuple[str, str]]:
+    """Discover ``(date, outdir)`` pairs for :func:`run_reduction` under ``ToOs``.
+
+    Supports:
+
+    - **Flat** (current gdrive layout): ``ToOs/<target>/rawdata`` with optional
+      ``.passta_night`` (written by :func:`passta.spec_download.download_gdrive_toos`).
+    - **Legacy nested**: ``ToOs/<target>/<YYYYMMDD>/rawdata``.
+
+    ``outdir`` for each job is ``base_dir/ToOs/<target>``.
+
+    Returns
+    -------
+    list[tuple[str, str]]
+        Sorted by target name then night label; each item is ``(date_arg, outdir)``.
+    """
+    toos = os.path.join(base_dir, 'ToOs')
+    if not os.path.isdir(toos):
+        raise SystemExit(f'goodman-pypeit-reduce --all-to-os: missing directory: {toos}')
+    rows: list[tuple[str, str, str]] = []
+    for target in sorted(os.listdir(toos)):
+        tpath = os.path.join(toos, target)
+        if not os.path.isdir(tpath) or target.startswith('.'):
+            continue
+
+        nested_nights: list[str] = []
+        for ymd in sorted(os.listdir(tpath)):
+            if not _YMD_DIR_RE.match(ymd):
+                continue
+            night = os.path.join(tpath, ymd)
+            if not os.path.isdir(night):
+                continue
+            raw = os.path.join(night, 'rawdata')
+            work = os.path.join(night, 'workspace')
+            if os.path.isdir(raw) or os.path.isdir(work):
+                nested_nights.append(ymd)
+
+        if nested_nights:
+            for ymd in sorted(nested_nights):
+                rows.append((target, _ymd_dir_to_date_arg(ymd), tpath))
+            continue
+
+        flat_raw = os.path.join(tpath, 'rawdata')
+        flat_work = os.path.join(tpath, 'workspace')
+        if not os.path.isdir(flat_raw) and not os.path.isdir(flat_work):
+            continue
+
+        meta = os.path.join(tpath, GDRIVE_NIGHT_LABEL_FILE)
+        date_label: str | None = None
+        if os.path.isfile(meta):
+            with open(meta, encoding='ascii', errors='replace') as sf:
+                date_label = sf.readline().strip()
+        if not date_label:
+            basenames = [
+                os.path.basename(p)
+                for p in glob.glob(os.path.join(flat_raw, '*.fits'))
+                + glob.glob(os.path.join(flat_raw, '*.fz'))
+            ]
+            ymd_pick = _pick_datedir_from_filenames(basenames)
+            if ymd_pick is not None:
+                date_label = _ymd_dir_to_date_arg(ymd_pick)
+        if not date_label:
+            logger.warning(
+                'Skipping %s: flat ToOs tree needs %s or parsable dates in frame names',
+                tpath,
+                GDRIVE_NIGHT_LABEL_FILE,
+            )
+            continue
+        rows.append((target, date_label, tpath))
+
+    rows.sort(key=lambda r: (r[0], r[1]))
+    return [(date_label, tpath) for target, date_label, tpath in rows]
 
 
 @contextlib.contextmanager
@@ -49,6 +132,283 @@ def _run_shell(cmd: str) -> None:
 
 def _fits_stem(filename: str) -> str:
     return filename.replace('.fits', '').replace('.fz', '')
+
+
+def _list_rawdata_frames(raw_dir: str) -> list[str]:
+    """Return Goodman FITS paths under ``raw_dir`` (``.fz`` preferred over same-stem ``.fits``)."""
+    fz = sorted(glob.glob(os.path.join(raw_dir, '*.fz')))
+    fits = sorted(glob.glob(os.path.join(raw_dir, '*.fits')))
+    fz_stems = {os.path.splitext(os.path.basename(p))[0] for p in fz}
+    fits_only = [
+        p for p in fits if os.path.splitext(os.path.basename(p))[0] not in fz_stems
+    ]
+    out = fz + fits_only
+    out.sort(key=os.path.basename)
+    return out
+
+
+def _infer_frame_extension(raw_dir: str, preferred: str = '.fits') -> str:
+    """Pick the PypeIt ``-e`` suffix from filenames under ``raw_dir``.
+
+    LCO archive downloads are typically ``*.fits.fz``; PypeIt matches them with
+    ``-e .fz``. Uncompressed Drive / local trees use ``-e .fits``.
+    """
+    files = _list_rawdata_frames(raw_dir)
+    if not files:
+        return preferred
+    lower = [p.lower() for p in files]
+    if any(p.endswith('.fits.fz') or (p.endswith('.fz') and not p.endswith('.fits')) for p in lower):
+        return '.fz'
+    if any(p.endswith('.fits') for p in lower):
+        return '.fits'
+    return preferred
+
+
+def _goodman_frame_header_hdu_index(hdulist: fits.HDUList, path: str) -> int:
+    """HDU index whose header carries Goodman science keys (``WAVMODE``, ``OBSTYPE``, …).
+
+    SOAR Goodman **uncompressed** ``.fits`` from the archive or Drive are often
+    single-extension (metadata on HDU 0). **fpacked** ``.fz`` products are typically
+    multi-extension with the science header on HDU 1. We prefer HDU 1 then 0 for
+    ``.fz`` / ``.fits.fz``, and HDU 0 then 1 otherwise, falling back to the first
+    extension that contains ``WAVMODE``.
+    """
+    pl = path.lower()
+    prefer = (1, 0) if pl.endswith('.fz') or pl.endswith('.fits.fz') else (0, 1)
+
+    def has_goodman_header(i: int) -> bool:
+        if i < 0 or i >= len(hdulist):
+            return False
+        h = hdulist[i]
+        hdr = getattr(h, 'header', None)
+        return hdr is not None and 'WAVMODE' in hdr
+
+    for i in prefer:
+        if has_goodman_header(i):
+            return i
+    for i in range(len(hdulist)):
+        if has_goodman_header(i):
+            return i
+    raise ValueError(f'No HDU with WAVMODE in {path!r} ({len(hdulist)} extension(s))')
+
+
+def _goodman_slit_from_header(hdr: fits.Header) -> str | None:
+    """Return slit/decker string matching PypeIt metadata ``decker`` (Goodman ``SLIT``)."""
+    for key in ('SLIT', 'DECKER'):
+        if key in hdr:
+            val = str(hdr[key]).strip()
+            if val:
+                return val.replace(' ', '_')
+    return None
+
+
+def _symlink_if_missing(src: str, dest: str) -> None:
+    if not os.path.exists(dest):
+        logger.info('Linking %s -> %s', src, dest)
+        os.symlink(src, dest)
+
+
+def _science_object_slit_groups(
+    wavedata: Sequence[dict[str, Any]],
+) -> list[tuple[str, str]]:
+    """Unique ``(object, slit)`` pairs that have on-sky science frames."""
+    keys: set[tuple[str, str]] = set()
+    for d in wavedata:
+        if d['obstype'] in {'SPECTRUM', 'OBJECT'} and d['object'].strip():
+            keys.add((d['object'], d['slit']))
+    return sorted(keys)
+
+
+def _link_reduction_directory(
+    wavedata: Sequence[dict[str, Any]],
+    objdir: str,
+    objname: str,
+    slit: str,
+) -> None:
+    """Symlink science and calibrators for one ``(object, slit)`` reduction tree."""
+    os.makedirs(objdir, exist_ok=True)
+    mjds: list[float] = []
+    for data in wavedata:
+        if data['slit'] != slit:
+            continue
+        filename = data['filename']
+        basefile = os.path.basename(filename)
+        outfile = os.path.join(objdir, basefile)
+        obstype = data['obstype']
+
+        if obstype in {'SPECTRUM', 'OBJECT'}:
+            if data['object'] != objname:
+                continue
+            mjds.append(data['mjd'])
+            _symlink_if_missing(filename, outfile)
+            continue
+        if obstype in {'ARC', 'COMP'}:
+            continue
+        _symlink_if_missing(filename, outfile)
+
+    if not mjds:
+        return
+
+    arcdata = [
+        d
+        for d in wavedata
+        if d['slit'] == slit and d['obstype'] in {'ARC', 'COMP'}
+    ]
+    if not arcdata:
+        return
+
+    avg_mjd = float(np.average(mjds))
+    arcfile = min(arcdata, key=lambda x: abs(x['mjd'] - avg_mjd))['filename']
+    _symlink_if_missing(arcfile, os.path.join(objdir, os.path.basename(arcfile)))
+
+
+def _build_reduction_dirs(
+    fullworkdir: str,
+    all_data: dict[str, list[dict[str, Any]]],
+) -> list[str]:
+    """Create per-``(wavemode, object, slit)`` workspace trees and return their paths."""
+    reduction_dirs: list[str] = []
+    for wavemode, wavedata in all_data.items():
+        wavedir = os.path.join(fullworkdir, wavemode)
+        os.makedirs(wavedir, exist_ok=True)
+        wavedata_sorted = sorted(wavedata, key=lambda x: x['mjd'])
+        for objname, slit in _science_object_slit_groups(wavedata_sorted):
+            objdir = os.path.join(wavedir, objname, slit)
+            _link_reduction_directory(wavedata_sorted, objdir, objname, slit)
+            reduction_dirs.append(objdir)
+    return reduction_dirs
+
+
+def _pypeit_files_in_objdir(spec: str, objdir: str) -> list[str]:
+    return sorted(glob.glob(os.path.join(objdir, f'{spec}_*', f'{spec}_*.pypeit')))
+
+
+def _pypeit_science_products_missing(science_dir: str, pypeit_table: Any) -> bool:
+    if not os.path.isdir(science_dir):
+        return True
+    for row in pypeit_table.data:
+        if row['frametype'] != 'science':
+            continue
+        framebase = _fits_stem(row['filename'])
+        if not glob.glob(os.path.join(science_dir, f'spec1d_{framebase}*.txt')):
+            return True
+    return False
+
+
+# Goodman lamp cards used by PypeIt ``SOARGoodmanSpectrograph.lamps`` / ``check_frame_type``.
+_GOODMAN_LAMP_ARC_CARDS = ('LAMP_HGA', 'LAMP_NE', 'LAMP_AR', 'LAMP_FE', 'LAMP_CU')
+_GOODMAN_LAMP_DOME_CARDS = ('LAMP_QUA', 'LAMP_BUL', 'LAMP_DOM')
+
+# ``OBSTYPE`` values that identify calibration or non-science frames (leave unchanged).
+_GOODMAN_CALIB_OBSTYPES = frozenset(
+    {
+        'ZERO',
+        'BIAS',
+        'DARK',
+        'FLAT',
+        'DFLAT',
+        'DOMEFLAT',
+        'PIXFLAT',
+        'SKYFLAT',
+        'ARC',
+        'COMP',
+        'COMPARISON',
+        'HAL',
+        'HALOGEN',
+        'CAL',
+        'LAMP',
+        'WAVE',
+        'CONTINUUM',
+        'PINHOLE',
+        'TRACE',
+        'ALIGN',
+        'DOME',
+        'INTERNAL',
+    }
+)
+
+# On-sky but not science extractions PypeIt should own via ``OBSTYPE=SPECTRUM``.
+_GOODMAN_OBSTYPES_LEAVE_UNCHANGED = frozenset({'SKY', 'ACQUISITION', 'ACQ', 'FOCUS', 'SETUP'})
+
+# Goodman spectroscopy headers use ``GHTS_RED`` / ``GHTS_BLUE``; imager+spec readout uses *_IMAGER.
+# If we skip normalization, ``OBSTYPE=OBJECT`` never becomes ``SPECTRUM`` and PypeIt cannot assign
+# ``science`` / ``standard`` (``soar_goodman.check_frame_type`` requires ``idname == 'SPECTRUM'``).
+_GOODMAN_INSTRUME_FOR_SPECTRUM_OBSTYPE = frozenset(
+    {'GHTS_RED', 'GHTS_BLUE', 'GHTS_RED_IMAGER', 'GHTS_BLUE_IMAGER'}
+)
+
+
+def _goodman_header_lamp_truthy(value: Any) -> bool:
+    """Return True when a Goodman ``LAMP_*`` card reads as *on* for frametyping."""
+    if value is None:
+        return False
+    s = str(value).strip().lower()
+    if s in ('', 'false', 'f', 'no', '0', 'none', 'off', 'n'):
+        return False
+    if s in ('true', 't', 'yes', '1', 'on', 'y'):
+        return True
+    try:
+        return float(s) != 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _goodman_header_has_arc_lamps(hdr: fits.Header) -> bool:
+    return any(_goodman_header_lamp_truthy(hdr.get(k)) for k in _GOODMAN_LAMP_ARC_CARDS)
+
+
+def _goodman_header_has_dome_lamps(hdr: fits.Header) -> bool:
+    """Any dome / quartz lamp used for Goodman flat-field style exposures."""
+    return any(_goodman_header_lamp_truthy(hdr.get(k)) for k in _GOODMAN_LAMP_DOME_CARDS)
+
+
+def _goodman_header_is_raw_calibration(hdr: fits.Header) -> bool:
+    """True when this frame should not receive ``OBSTYPE=SPECTRUM`` normalization."""
+    ot = str(hdr.get('OBSTYPE', '')).strip().upper()
+    if ot in _GOODMAN_CALIB_OBSTYPES:
+        return True
+    if ot in _GOODMAN_OBSTYPES_LEAVE_UNCHANGED:
+        return True
+    if _goodman_header_has_arc_lamps(hdr):
+        return True
+    if _goodman_header_has_dome_lamps(hdr):
+        return True
+    try:
+        exptime = float(hdr.get('EXPTIME', 0.0) or 0.0)
+    except (TypeError, ValueError):
+        exptime = 0.0
+    if exptime < 0.01 and ot in {'', 'ZERO', 'BIAS'}:
+        return True
+    return False
+
+
+def _goodman_normalize_header_for_pypeit_frametyping(hdr: fits.Header) -> str | None:
+    """Set ``OBSTYPE=SPECTRUM`` for Goodman on-sky frames so PypeIt can type science/standard.
+
+    PypeIt's Goodman logic requires ``OBSTYPE`` (mapped to ``idname``) to be the
+    literal ``SPECTRUM`` for both science and flux standards; ``OBJECT`` and
+    other archive values never match. We rewrite only when the header does not
+    already describe a bias, flat, arc, or similar calibration (by ``OBSTYPE``
+    or lamp status), matching the user's exclusion list for calibration types.
+
+    Returns
+    -------
+    str or None
+        The previous ``OBSTYPE`` string if it was changed, else ``None``.
+    """
+    instr = str(hdr.get('INSTRUME', '')).strip().upper()
+    if instr not in _GOODMAN_INSTRUME_FOR_SPECTRUM_OBSTYPE:
+        return None
+
+    prev = str(hdr.get('OBSTYPE', '')).strip()
+    prev_u = prev.upper()
+    if prev_u == 'SPECTRUM':
+        return None
+    if _goodman_header_is_raw_calibration(hdr):
+        return None
+
+    hdr['OBSTYPE'] = 'SPECTRUM'
+    return prev if prev else '(empty)'
 
 
 def _spec1d_as_fits(filename: str) -> str:
@@ -126,13 +486,26 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     add_version_argument(parser)
     parser.add_argument(
+        '--all-to-os',
+        dest='all_to_os',
+        metavar='BASEDIR',
+        default=None,
+        help=(
+            'Run reduction for every ``BASEDIR/ToOs/<name>/`` target (flat ``rawdata`` '
+            'or legacy ``<YYYYMMDD>/rawdata``) that has data. Omit DATE and OUTDIR when '
+            'using this option.'
+        ),
+    )
+    parser.add_argument(
         'date',
-        type=str,
+        nargs='?',
+        default=None,
         help='Night label matching the dated reduction tree under ``outdir``.',
     )
     parser.add_argument(
         'outdir',
-        type=str,
+        nargs='?',
+        default=None,
         help='Base directory containing ``<YYYYMMDD>/rawdata`` and ``workspace``.',
     )
     parser.add_argument(
@@ -170,32 +543,85 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         metavar='N',
         help='Parallel PypeIt setup/reduce/SNID workers (default 1). Use 2--4 on multi-core hosts.',
     )
+    parser.add_argument(
+        '--frame-extension',
+        default=None,
+        help=(
+            'Suffix passed to ``pypeit_setup`` for frames linked into each object '
+            'directory (default: infer ``.fz`` for ``*.fits.fz`` LCO downloads, '
+            'else ``.fits`` for uncompressed data).'
+        ),
+    )
+    parser.add_argument(
+        '--slit-pos',
+        type=float,
+        default=505.0,
+        metavar='PIX',
+        dest='slit_pos',
+        help=(
+            'Spatial pixel position (spat_pixpos) for choosing the science trace in '
+            'parse_pypeit_output (default 505). Pixel tolerance is still widened in '
+            'steps of 15, 30, then 60.'
+        ),
+    )
+    parser.add_argument(
+        '--no-try-old',
+        dest='try_old',
+        action='store_false',
+        help=(
+            'Enforce PypeIt ``SpecObj`` datamodel version checks during ``pypeit_flux_calib`` '
+            '(default: pass ``--try_old``, skipping version checks).'
+        ),
+    )
+    parser.set_defaults(try_old=True)
     add_logging_arguments(parser)
     args = parser.parse_args(argv)
-    args.outdir = os.path.abspath(args.outdir)
+    if args.all_to_os is not None:
+        args.all_to_os = os.path.abspath(os.path.expanduser(args.all_to_os))
+        if args.date is not None or args.outdir is not None:
+            parser.error('With --all-to-os BASEDIR, omit DATE and OUTDIR positionals.')
+    else:
+        if args.date is None or args.outdir is None:
+            parser.error('Expected DATE OUTDIR (or use --all-to-os BASEDIR alone).')
+        args.outdir = os.path.abspath(os.path.expanduser(args.outdir))
     if args.slack_dry_run:
         args.snid = True
+    if args.frame_extension is not None and not str(args.frame_extension).startswith('.'):
+        parser.error('--frame-extension must start with a dot (e.g. .fits or .fz)')
     return args
 
 
-def _pypeit_setup_objdir(spec: str, objdir: str) -> None:
+def _pypeit_setup_objdir(spec: str, objdir: str, frame_extension: str = '.fits') -> None:
     """Run PypeIt setup for one reduction directory via :mod:`passta.pypeit_invoke`."""
-    pypeit_invoke.run_setup(spec, objdir, objdir)
+    pypeit_invoke.run_setup(spec, objdir, objdir, extension=frame_extension)
 
 
-def _pypeit_reduce_objdir(spec: str, objdir: str, caldb_dir: str) -> list[tuple[Any, ...]]:
+def _pypeit_reduce_objdir(
+    spec: str,
+    objdir: str,
+    caldb_dir: str,
+    *,
+    slit_pos: float = 505.0,
+) -> list[tuple[Any, ...]]:
     """Run PypeIt reduction if needed and return science rows from :func:`parse_pypeit_output`."""
-    pypeit_file = os.path.join(objdir, f'{spec}_A/{spec}_A.pypeit')
-    science_dir = os.path.join(objdir, 'Science')
-    if not os.path.exists(pypeit_file):
+    pypeit_files = _pypeit_files_in_objdir(spec, objdir)
+    if not pypeit_files:
         logger.error('pypeit_setup failed or missing .pypeit for %s', objdir)
         return []
-    pypeit_table = inputfiles.PypeItFile.from_file(pypeit_file)
-    if not os.path.exists(science_dir):
-        pypeit_invoke.run_pypeit(pypeit_file, objdir)
-    else:
-        logger.info('Reduction already done for %s', objdir)
-    return parse_pypeit_output(science_dir, pypeit_table, caldb_dir)
+
+    science_dir = os.path.join(objdir, 'Science')
+    objdata: list[tuple[Any, ...]] = []
+    for pypeit_file in pypeit_files:
+        pypeit_table = inputfiles.PypeItFile.from_file(pypeit_file)
+        setup = os.path.basename(os.path.dirname(pypeit_file))
+        if _pypeit_science_products_missing(science_dir, pypeit_table):
+            pypeit_invoke.run_pypeit(pypeit_file, objdir)
+        else:
+            logger.info('Reduction already done for %s (%s)', objdir, setup)
+        objdata.extend(
+            parse_pypeit_output(science_dir, pypeit_table, caldb_dir, slit_pos=slit_pos)
+        )
+    return objdata
 
 
 def parse_pypeit_output(
@@ -352,8 +778,11 @@ def make_flux_file(objdata: list[tuple[Any, ...]], fullsensfile: str) -> str | N
     flux_filename = os.path.join(dirname, f'{target}.flux')
 
     with open(flux_filename, 'w') as f:
+        # ``extrap_sens`` allows science wavelengths outside the std sensfunc grid (e.g. Goodman
+        # coverage bluer than the standard); otherwise ``pypeit_flux_calib`` raises PypeItError.
         f.write('[fluxcalib] \n')
-        f.write('  extinct_correct = False \n\n')
+        f.write('  extinct_correct = False \n')
+        f.write('  extrap_sens = True \n\n')
         f.write('flux read \n')
         f.write(f'  path {dirname} \n')
         f.write('filename | sensfile \n')
@@ -400,6 +829,8 @@ def pypeit_post_process(
     objdata: list[tuple[Any, ...]],
     specdir: str,
     caldb_dir: str,
+    *,
+    try_old: bool = True,
 ) -> str | None:
     """Flux-calibrate, coadd, telluric-correct, and symlink the final spectrum.
 
@@ -443,7 +874,7 @@ def pypeit_post_process(
     if flux_filename is None:
         return None
 
-    pypeit_invoke.run_flux_calib(flux_filename, flux_par_outfile)
+    pypeit_invoke.run_flux_calib(flux_filename, flux_par_outfile, try_old=try_old)
 
     out_1dfilename = f'{target}.{datestr}.{dispname}.coadd1d.fits'
     fullout_1dfilename = os.path.join(dirname, out_1dfilename)
@@ -571,8 +1002,133 @@ def post_slack_results(
     slack_utils.post_slack_files(client, file_ids, message, channel)
 
 
+def _parse_snid_sage_output_pypi(text: str) -> Table | None:
+    """Parse PyPI ``snid-sage`` text ``.output`` (TEMPLATE MATCHES table)."""
+    if 'TEMPLATE MATCHES' not in text:
+        return None
+    rows: list[list[str]] = []
+    capture = False
+    for line in text.splitlines():
+        ls = line.strip()
+        if '# Template' in ls and 'Subtype' in ls:
+            capture = True
+            continue
+        if not capture:
+            continue
+        if not ls:
+            if rows:
+                break
+            continue
+        if set(ls) <= {'-', '|'}:
+            continue
+        segs = [s for s in re.split(r'\s{2,}', line.strip()) if s]
+        if len(segs) < 7:
+            continue
+        try:
+            idx_name = segs[0].split(None, 1)
+            if len(idx_name) != 2:
+                continue
+            idx_s, name = idx_name
+            int(idx_s)
+        except (ValueError, IndexError):
+            continue
+        typ, subtype, rlap, z, ze, age = segs[1], segs[2], segs[3], segs[4], segs[5], segs[6]
+        rows.append([idx_s, name, typ, subtype, rlap, z, ze, age])
+    if not rows:
+        return None
+    columns = [list(row) for row in zip(*rows)]
+    return Table(
+        columns,
+        names=('idx', 'name', 'type', 'subtype', 'rlap-ccc', 'redshift', 'error', 'age'),
+    )
+
+
+def _parse_snid_sage_output_legacy(text: str) -> Table | None:
+    """Parse legacy SNID SAGE ``.output`` (table after a ``--------------------`` rule)."""
+    data_start = False
+    all_data: list[list[str]] = []
+    for line in text.splitlines():
+        if line.startswith('--------------------'):
+            data_start = True
+        elif not data_start:
+            continue
+        else:
+            all_data.append(line.split())
+    if not all_data or not all(len(r) > 0 for r in all_data):
+        return None
+    columns = [list(row) for row in zip(*all_data)]
+    return Table(
+        columns,
+        names=('idx', 'name', 'type', 'subtype', 'rlap-ccc', 'redshift', 'error', 'age'),
+    )
+
+
+def _parse_snid_sage_output_file(result_file: str) -> Table | None:
+    """Load ``.output`` from disk; prefer PyPI ``snid-sage`` format when detected."""
+    with open(result_file, encoding='utf-8', errors='replace') as outf:
+        text = outf.read()
+    if 'TEMPLATE MATCHES' in text:
+        tbl = _parse_snid_sage_output_pypi(text)
+        if tbl is not None:
+            return tbl
+    return _parse_snid_sage_output_legacy(text)
+
+
+def _run_snid_sage_identify_in_process(filepath: str, results_dir: str, logpath: str) -> int:
+    """Call **snid-sage**'s CLI entry point in-process (same as ``sage identify …``).
+
+    Uses ``snid_sage.interfaces.cli.main.main`` so behavior matches the installed
+    ``sage`` console script without a subprocess. Stdout/stderr from the run are
+    appended to ``logpath``.
+    """
+    try:
+        import matplotlib
+
+        matplotlib.use('Agg')
+    except Exception:
+        pass
+
+    from snid_sage.interfaces.cli.main import main as snid_sage_cli_main
+
+    argv = [
+        '--quiet',
+        'identify',
+        filepath,
+        '-o',
+        results_dir,
+        '--no-progress',
+    ]
+    logger.info('Running SNID SAGE in-process: sage %s', ' '.join(argv))
+
+    rc = 1
+    with open(logpath, 'w', encoding='utf-8', errors='replace') as logf:
+        logf.write(f'# argv: sage {" ".join(argv)}\n')
+        try:
+            with contextlib.redirect_stdout(logf), contextlib.redirect_stderr(logf):
+                out_rc = snid_sage_cli_main(argv)
+            rc = 0 if out_rc is None else int(out_rc)
+        except SystemExit as exc:
+            code = exc.code
+            if code is None:
+                rc = 0
+            elif isinstance(code, int):
+                rc = code
+            else:
+                rc = 1
+        except Exception:
+            rc = 1
+            logger.exception('SNID SAGE identify failed (log: %s)', logpath)
+    if rc != 0:
+        logger.error('SNID SAGE identify returned code %s (log: %s)', rc, logpath)
+    return rc
+
+
 def run_snid_sage(filepath: str) -> dict[str, Any]:
-    """Run external ``sage`` (SNID SAGE) on a 1D spectrum and parse outputs.
+    """Run **snid-sage** identification on a 1D spectrum and parse outputs.
+
+    Calls the same code path as the ``sage identify … -o`` CLI via
+    :func:`_run_snid_sage_identify_in_process` (no subprocess). Legacy ``.output``
+    formats are still parsed if present.
 
     Parameters
     ----------
@@ -596,28 +1152,16 @@ def run_snid_sage(filepath: str) -> dict[str, Any]:
     logpath = os.path.join(results_dir, basename.replace('.fits', '.log'))
 
     if not os.path.exists(result_file):
-        _run_shell(f'sage {filepath} -o {results_dir} > {logpath} 2> {logpath}')
+        try:
+            _run_snid_sage_identify_in_process(filepath, results_dir, logpath)
+        except ImportError as exc:
+            logger.error('snid-sage is required for --snid: %s', exc)
+            return {'results': None, 'plot': None}
 
     out: dict[str, Any] = {'results': None, 'plot': None}
 
     if os.path.exists(result_file):
-        data_start = False
-        all_data: list[list[str]] = []
-        with open(result_file) as outf:
-            for line in outf:
-                if line.startswith('--------------------'):
-                    data_start = True
-                elif not data_start:
-                    continue
-                else:
-                    all_data.append(line.split())
-
-        if all_data and all(len(r) > 0 for r in all_data):
-            columns = [list(row) for row in zip(*all_data)]
-            out['results'] = Table(
-                columns,
-                names=('idx', 'name', 'type', 'subtype', 'rlap-ccc', 'redshift', 'error', 'age'),
-            )
+        out['results'] = _parse_snid_sage_output_file(result_file)
 
     if os.path.exists(spec_plot):
         out['plot'] = spec_plot
@@ -633,6 +1177,10 @@ def run_reduction(
     slack: bool = False,
     slack_dry_run: bool = False,
     parallel_jobs: int = 1,
+    *,
+    frame_extension: str | None = None,
+    slit_pos: float = 505.0,
+    try_old: bool = True,
 ) -> None:
     """Main driver: symlink raw data, run PypeIt setup and reduction in-process, post-process.
 
@@ -655,10 +1203,19 @@ def run_reduction(
     parallel_jobs : int, optional
         If greater than 1, run independent PypeIt setup, reduction, and SNID
         steps with a thread pool (default 1). Keep small (2--4) on NFS hosts.
+    frame_extension : str or None, optional
+        Filename suffix for ``pypeit_setup`` (``-e``). If omitted, infer ``.fz`` when
+        ``rawdata`` holds ``*.fits.fz`` LCO frames, otherwise ``.fits``.
+    slit_pos : float, optional
+        Passed to :func:`parse_pypeit_output` to select the science trace nearest this
+        ``spat_pixpos`` (default 505).
+    try_old : bool, optional
+        If True (default), run ``pypeit_flux_calib`` with ``--try_old``. Pass ``--no-try-old``
+        on the CLI to enforce ``SpecObj`` datamodel version checks.
 
     Notes
     -----
-    Exits silently if neither ``rawdata`` nor ``workspace`` exists for the date.
+    Returns immediately if neither ``rawdata`` nor ``workspace`` exists for the date.
     """
     if caldb_dir is None:
         caldb_dir = default_caldb_dir()
@@ -672,32 +1229,81 @@ def run_reduction(
     lco = LCOGT()
 
     datedir = Time(date).datetime.strftime('%Y%m%d')
-    fulloutdir = os.path.join(outdir, datedir, 'rawdata')
-    fullworkdir = os.path.join(outdir, datedir, 'workspace')
+    nested_raw = os.path.join(outdir, datedir, 'rawdata')
+    nested_work = os.path.join(outdir, datedir, 'workspace')
+    flat_raw = os.path.join(outdir, 'rawdata')
+    flat_work = os.path.join(outdir, 'workspace')
+
+    nested_ok = os.path.isdir(nested_raw) or os.path.isdir(nested_work)
+    flat_ok = os.path.isdir(flat_raw) or os.path.isdir(flat_work)
+
+    if nested_ok and flat_ok:
+        logger.warning(
+            'Both %s and %s exist; using nested dated layout for %s',
+            flat_raw,
+            nested_raw,
+            datedir,
+        )
+    if nested_ok and not flat_ok:
+        fulloutdir, fullworkdir = nested_raw, nested_work
+    elif flat_ok and not nested_ok:
+        fulloutdir, fullworkdir = flat_raw, flat_work
+    elif nested_ok and flat_ok:
+        fulloutdir, fullworkdir = nested_raw, nested_work
+    else:
+        fulloutdir, fullworkdir = nested_raw, nested_work
+
     fullspecdir = os.path.join(outdir, 'spectra')
     fullslackdir = os.path.join(outdir, 'spectra', 'slack')
 
     if not os.path.exists(fulloutdir) and not os.path.exists(fullworkdir):
         logger.info('No data to process for %s', date)
-        sys.exit(0)
+        return
 
     os.makedirs(fullspecdir, exist_ok=True)
     os.makedirs(fullslackdir, exist_ok=True)
 
-    files = sorted(glob.glob(os.path.join(fulloutdir, '*.fz')))
+    files = _list_rawdata_frames(fulloutdir)
+    if not files:
+        logger.info('No *.fz or *.fits frames in %s for %s', fulloutdir, date)
+        return
+
+    if frame_extension is None:
+        frame_extension = _infer_frame_extension(fulloutdir)
+        logger.info('PypeIt frame extension %s (inferred from rawdata filenames)', frame_extension)
+    else:
+        logger.info('PypeIt frame extension %s (from --frame-extension)', frame_extension)
+
     all_data: dict[str, list[dict[str, Any]]] = {}
     spec = 'soar_goodman_red'
 
     for path in files:
         with fits.open(path, mode='update') as hdu:
-            wavemode = hdu[1].header['WAVMODE']
-            obstype = hdu[1].header['OBSTYPE']
-            objname = lco.sanitize_objname(hdu[1].header['OBJECT'])
-            hdu[1].header['OBJECT'] = objname
-            mjd = Time(hdu[1].header['DATE-OBS']).mjd
+            hi = _goodman_frame_header_hdu_index(hdu, path)
+            hdr = hdu[hi].header
+            prev_obstype = _goodman_normalize_header_for_pypeit_frametyping(hdr)
+            if prev_obstype is not None:
+                logger.info(
+                    'Goodman PypeIt frametyping: OBSTYPE %s -> SPECTRUM in %s',
+                    prev_obstype,
+                    os.path.basename(path),
+                )
+            wavemode = hdr['WAVMODE']
+            obstype = str(hdr.get('OBSTYPE', '')).strip()
+            objname = lco.sanitize_objname(hdr['OBJECT'])
+            hdr['OBJECT'] = objname
+            mjd = Time(hdr['DATE-OBS']).mjd
 
-            if hdu[1].header['INSTRUME'].upper() == 'GHTS_BLUE':
+            if hdr['INSTRUME'].upper() == 'GHTS_BLUE':
                 spec = 'soar_goodman_blue'
+
+            slit = _goodman_slit_from_header(hdr)
+            if slit is None:
+                logger.warning(
+                    'No SLIT/DECKER in %s; skipping frame',
+                    os.path.basename(path),
+                )
+                continue
 
             data = {
                 'wavemod': wavemode,
@@ -705,6 +1311,7 @@ def run_reduction(
                 'filename': path,
                 'object': objname,
                 'mjd': mjd,
+                'slit': slit,
             }
 
             if wavemode not in {'400_M1', '400_M2'}:
@@ -712,69 +1319,33 @@ def run_reduction(
 
             all_data.setdefault(wavemode, []).append(data)
 
-    reduction_dirs: list[str] = []
-
-    for wavemode, wavedata in all_data.items():
-        wavedir = os.path.join(fullworkdir, wavemode)
-        os.makedirs(wavedir, exist_ok=True)
-
-        wavedata = sorted(wavedata, key=lambda x: x['mjd'])
-        arcdata = [d for d in wavedata if d['obstype'] in {'ARC', 'COMP'}]
-        all_objs = np.unique(
-            [
-                d['object']
-                for d in wavedata
-                if d['obstype'] in {'SPECTRUM', 'OBJECT'} and d['object'].strip()
-            ]
-        )
-
-        for objname in all_objs:
-            objdir = os.path.join(wavedir, objname)
-            os.makedirs(objdir, exist_ok=True)
-
-            mjds = []
-            for data in wavedata:
-                filename = data['filename']
-                basefile = os.path.basename(filename)
-                outfile = os.path.join(objdir, basefile)
-
-                if data['obstype'] in {'SPECTRUM', 'OBJECT'}:
-                    mjds.append(data['mjd'])
-                    if data['object'] != objname:
-                        continue
-                if data['obstype'] in {'ARC', 'COMP'}:
-                    continue
-
-                if not os.path.exists(outfile):
-                    logger.info('Linking %s -> %s', filename, outfile)
-                    os.symlink(filename, outfile)
-
-            avg_mjd = float(np.average(mjds))
-            arcdata_sorted = sorted(arcdata, key=lambda x: abs(x['mjd'] - avg_mjd))
-            arcfile = arcdata_sorted[0]['filename']
-            basefile = os.path.basename(arcfile)
-            outfile = os.path.join(objdir, basefile)
-
-            if not os.path.exists(outfile):
-                logger.info('Linking %s -> %s', arcfile, outfile)
-                os.symlink(arcfile, outfile)
-
-            reduction_dirs.append(objdir)
+    reduction_dirs = _build_reduction_dirs(fullworkdir, all_data)
 
     jobs = max(1, parallel_jobs)
 
-    _parallel_each(jobs, reduction_dirs, lambda od: _pypeit_setup_objdir(spec, od))
+    # Goodman upstream only allows ``.fz``; keep PASSTA shim active for setup and
+    # ``run_pypeit`` (which re-checks raw paths from the .pypeit file).
+    with pypeit_invoke.goodman_raw_fits_runtime(spec, frame_extension):
+        _parallel_each(
+            jobs,
+            reduction_dirs,
+            lambda od, sp=spec, ext=frame_extension: _pypeit_setup_objdir(sp, od, ext),
+        )
 
-    raw_obj = _parallel_map_unordered(
-        jobs,
-        reduction_dirs,
-        lambda od: _pypeit_reduce_objdir(spec, od, caldb_dir),
-    )
+        raw_obj = _parallel_map_unordered(
+            jobs,
+            reduction_dirs,
+            lambda od, sp=spec, cdb=caldb_dir, spos=slit_pos: _pypeit_reduce_objdir(
+                sp, od, cdb, slit_pos=spos
+            ),
+        )
     all_objdata: list[list[tuple[Any, ...]]] = [od for od in raw_obj if len(od) > 0]
 
     outlinks: list[str | None] = []
     for objdata in all_objdata:
-        outlinks.append(pypeit_post_process(objdata, fullspecdir, caldb_dir))
+        outlinks.append(
+            pypeit_post_process(objdata, fullspecdir, caldb_dir, try_old=try_old)
+        )
 
     links_done = [L for L in outlinks if L and os.path.exists(L)]
     if snid and links_done:
@@ -797,15 +1368,41 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_arguments(argv)
     configure_from_parsed_args(args)
     caldb_dir = args.caldb if args.caldb is not None else default_caldb_dir()
-    run_reduction(
-        args.date,
-        args.outdir,
-        caldb_dir=caldb_dir,
-        snid=args.snid,
-        slack=args.slack,
-        slack_dry_run=args.slack_dry_run,
-        parallel_jobs=args.jobs,
-    )
+    if args.all_to_os is not None:
+        jobs = discover_to_os_reduction_jobs(args.all_to_os)
+        if not jobs:
+            logger.info(
+                'No ToOs targets with rawdata or workspace under %s',
+                os.path.join(args.all_to_os, 'ToOs'),
+            )
+            return
+        for date_label, od in jobs:
+            logger.info('ToOs batch: date=%s outdir=%s', date_label, od)
+            run_reduction(
+                date_label,
+                od,
+                caldb_dir=caldb_dir,
+                snid=args.snid,
+                slack=args.slack,
+                slack_dry_run=args.slack_dry_run,
+                parallel_jobs=args.jobs,
+                frame_extension=args.frame_extension,
+                slit_pos=args.slit_pos,
+                try_old=args.try_old,
+            )
+    else:
+        run_reduction(
+            args.date,
+            args.outdir,
+            caldb_dir=caldb_dir,
+            snid=args.snid,
+            slack=args.slack,
+            slack_dry_run=args.slack_dry_run,
+            parallel_jobs=args.jobs,
+            frame_extension=args.frame_extension,
+            slit_pos=args.slit_pos,
+            try_old=args.try_old,
+        )
 
 
 if __name__ == '__main__':
