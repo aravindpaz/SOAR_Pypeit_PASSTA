@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import textwrap
 
-from passta.pypeit_reduce import _parse_snid_sage_output_legacy, _parse_snid_sage_output_pypi
+from passta.pypeit_reduce import (
+    _parse_snid_sage_output_legacy,
+    _parse_snid_sage_output_pypi,
+    _parse_snid_sage_summary,
+)
 
 
 SAMPLE_PYPY = textwrap.dedent(
@@ -12,6 +16,11 @@ SAMPLE_PYPY = textwrap.dedent(
     ================================
     SNID-SAGE CLASSIFICATION RESULTS
     ================================
+
+    ---------------------------------------------------------------------------
+    | Type   | Subtype      |        z |      z_err |  age [d] |  age_err [d] |
+    ---------------------------------------------------------------------------
+    | II     | II-87A       | 0.005938 |   0.000872 |    190.6 |        278.1 |
 
     TEMPLATE MATCHES (from Best Cluster - Auto-Selected):
     ------------------------------------------------------------------------------
@@ -21,6 +30,14 @@ SAMPLE_PYPY = textwrap.dedent(
       2 SN2007gr         Ic     Ic-narrow      2.10    0.061000    0.006000    0.0
     """
 )
+
+
+def test_parse_snid_sage_summary():
+    summary = _parse_snid_sage_summary(SAMPLE_PYPY)
+    assert summary is not None
+    assert summary['type'] == 'II'
+    assert summary['subtype'] == 'II-87A'
+    assert summary['redshift'] == '0.005938'
 
 
 def test_parse_snid_sage_output_pypi_table():

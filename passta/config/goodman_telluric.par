@@ -1,0 +1,18 @@
+# Goodman telluric correction (objmodel=poly) for goodman-pypeit-tellfit / pypeit_tellfit.
+# Apply with: goodman-pypeit-tellfit COADD.fits --objmodel poly -t goodman_telluric.par
+# Selected by iterate_vs_manual_broad.py: B049 (poly p2 npca5 pop12 tol=0.005)
+# vs manual skew-Gauss: norm_rms=0.0361, score=0.0540, runtime=53s
+# Broad search: 72 methods, 58 ok, 14 timeout
+[telluric]
+    objmodel = poly
+    telgridfile = TellPCA_3000_26000_R15000.fits
+    teltype = pca
+    tell_npca = 5
+    func = legendre
+    model = poly
+    polyorder = 2
+    maxiter = 2
+    popsize = 12
+    polish = False
+    tol = 0.005
+    mask_lyman_a = True

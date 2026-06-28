@@ -1,0 +1,38 @@
+# PASSTA fixture: minimal soar_goodman_red .pypeit for ingest/format tests.
+# Mirrors the param block merged from passta/config/goodman_flatfield.par.
+
+[rdx]
+    spectrograph = soar_goodman_red
+# Goodman red/blue defaults (400_M1 / 400_M2 and shared setups).
+# Blue-end ghost mitigation (3580-3720 A): enable pixel flat below 3800 A with
+# finer B-spline sampling (see test_data/ghost_correction/ benchmarks).
+[calibrations]
+    [[flatfield]]
+        pixelflat_min_wave = 3500
+        spec_samp_coarse = 40
+        spat_samp = 5
+        slit_illum_finecorr = False
+[scienceframe]
+    [[process]]
+        use_illumflat = False
+[reduce]
+    [[skysub]]
+        bspline_spacing = 1.0
+        no_poly = True
+        sky_sigrej = 5.0
+
+setup read
+Setup A:
+  binning: 2,2
+  decker: 1.0_LONG_SLIT
+  dispangle: 7.5
+  dispname: 400_SYZY
+  mode: 400_M2
+setup end
+
+data read
+ path /tmp/passta_fixture
+                                filename | frametype | ra | dec | target | dispname | decker | binning | mjd | airmass | exptime | mode | dispangle | calib
+2026ayt.ut260624.400_M2.95691198.fits.fz | arc,tilt | 141.847525 | -32.008514 | 2026ayt | 400_SYZY | 1.0_LONG_SLIT | 2,2 | 61215.00283103009 | 1.6 | 0.5 | 400_M2 | 7.4997 | 0
+2026ayt.ut260624.400_M2.95691309.fits.fz | science | 141.845296 | -32.012286 | 2026ayt | 400_SYZY | 1.0_LONG_SLIT | 2,2 | 61215.00519152778 | 1.62 | 450.0 | 400_M2 | 7.4997 | 0
+data end

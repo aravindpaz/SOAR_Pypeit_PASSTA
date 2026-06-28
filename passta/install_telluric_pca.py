@@ -1,4 +1,9 @@
-"""Download PypeIt telluric PCA from Google Drive and register it with ``pypeit_install_telluric``."""
+"""Download PypeIt telluric PCA and optionally register it with PypeIt.
+
+PASSTA ships ``TellPCA_3000_26000_R15000.fits`` under ``passta/data/telluric/``
+for ``goodman-pypeit-tellfit``. This helper remains for installing the grid into
+the PypeIt cache when using ``pypeit_tellfit`` directly.
+"""
 
 from __future__ import annotations
 

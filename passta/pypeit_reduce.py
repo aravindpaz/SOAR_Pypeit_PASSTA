@@ -1,6 +1,10 @@
-"""Run PypeIt on archived PASSTA Goodman data: setup, reduce, flux, coadd, telluric."""
+"""Run PypeIt on archived PASSTA Goodman data: setup, reduce, flux, and coadd."""
 
 from __future__ import annotations
+
+import os
+
+os.environ.setdefault('MPLBACKEND', 'Agg')
 
 import argparse
 import astropy
@@ -22,10 +26,11 @@ from astropy.io import ascii, fits
 from astropy.table import Table, unique
 from astropy.time import Time
 
+from passta import pypeit_files as pypeit_file_io  # applies PypeIt InputFile read patch
+from passta import pypeit_invoke
 from pypeit import inputfiles
 
 from passta import slack_utils
-from passta import pypeit_invoke
 from passta.logging_config import add_logging_arguments, configure_from_parsed_args
 from passta.lcogt import LCOGT
 from passta.spec_download import GDRIVE_NIGHT_LABEL_FILE, _pick_datedir_from_filenames
@@ -427,8 +432,13 @@ def _parallel_each(jobs: int, items: Sequence, fn) -> None:
             fn(x)
         return
     w = min(n, len(items))
+
+    def _run(item):
+        pypeit_invoke.ensure_headless_matplotlib()
+        return fn(item)
+
     with ThreadPoolExecutor(max_workers=w) as pool:
-        futs = [pool.submit(fn, x) for x in items]
+        futs = [pool.submit(_run, x) for x in items]
         for fut in as_completed(futs):
             fut.result()
 
@@ -438,8 +448,13 @@ def _parallel_map_unordered(jobs: int, items: Sequence, fn):
     if n <= 1 or len(items) <= 1:
         return [fn(x) for x in items]
     w = min(n, len(items))
+
+    def _run(item):
+        pypeit_invoke.ensure_headless_matplotlib()
+        return fn(item)
+
     with ThreadPoolExecutor(max_workers=w) as pool:
-        futs = [pool.submit(fn, x) for x in items]
+        futs = [pool.submit(_run, x) for x in items]
         return [fut.result() for fut in as_completed(futs)]
 
 
@@ -449,7 +464,9 @@ def default_caldb_dir() -> str:
 
 
 def refresh_astropy_cache() -> None:
-    """Force-download Astropy observatory/site data with a few retries."""
+    """Force-download Astropy observatory/site data and pre-load IERS tables."""
+    from passta.astropy_iers import ensure_astropy_iers_ready
+
     tries = 0
     while tries < 5:
         try:
@@ -466,6 +483,7 @@ def refresh_astropy_cache() -> None:
                 exc,
             )
             time.sleep(5)
+    ensure_astropy_iers_ready()
 
 
 def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -612,6 +630,7 @@ def _pypeit_reduce_objdir(
     science_dir = os.path.join(objdir, 'Science')
     objdata: list[tuple[Any, ...]] = []
     for pypeit_file in pypeit_files:
+        pypeit_file_io.sanitize_pypeit_file(pypeit_file)
         pypeit_table = inputfiles.PypeItFile.from_file(pypeit_file)
         setup = os.path.basename(os.path.dirname(pypeit_file))
         if _pypeit_science_products_missing(science_dir, pypeit_table):
@@ -832,21 +851,24 @@ def pypeit_post_process(
     *,
     try_old: bool = True,
 ) -> str | None:
-    """Flux-calibrate, coadd, telluric-correct, and symlink the final spectrum.
+    """Flux-calibrate, coadd, and symlink the final 1D spectrum.
+
+    Telluric correction is disabled in the pipeline (see ``passta.tellfit``);
+    run ``goodman-pypeit-tellfit`` on the coadd when needed.
 
     Parameters
     ----------
     objdata : list of tuple
         Science rows for a single object from :func:`parse_pypeit_output`.
     specdir : str
-        Directory where the telluric-corrected FITS symlink is created.
+        Directory where the coadd FITS symlink is created.
     caldb_dir : str
         Location of ``caldb.txt`` and sensitivity functions.
 
     Returns
     -------
     str or None
-        Path to the telluric-corrected spectrum if produced, else None.
+        Path to the flux-calibrated coadd spectrum if produced, else None.
 
     Raises
     ------
@@ -888,22 +910,34 @@ def pypeit_post_process(
     if not os.path.exists(fullout_1dfilename):
         pypeit_invoke.run_coadd_1dspec(coadd_filename, par_outfile)
 
-    if os.path.exists(fullout_1dfilename):
+    from passta.tellfit import TELLURIC_CORRECTION_ENABLED
+
+    final_path = full_tellcorrfilename if TELLURIC_CORRECTION_ENABLED else fullout_1dfilename
+    if TELLURIC_CORRECTION_ENABLED and os.path.exists(fullout_1dfilename):
         tell_par_outfile = os.path.join(dirname, 'tellfit.par')
+        tell_file = pypeit_invoke.goodman_telluric_param_file()
+        if tell_file:
+            logger.info('Telluric parameter file %s', tell_file)
         if not os.path.exists(full_tellcorrfilename):
             with _working_directory(dirname):
                 pypeit_invoke.run_tellfit(
                     fullout_1dfilename,
                     objmodel='poly',
                     par_outfile=tell_par_outfile,
+                    tell_file=tell_file,
                 )
+    elif os.path.exists(fullout_1dfilename):
+        logger.info(
+            'Telluric correction skipped (pipeline disabled); use goodman-pypeit-tellfit on %s',
+            fullout_1dfilename,
+        )
 
-    if os.path.exists(full_tellcorrfilename):
-        outlink = os.path.join(specdir, os.path.basename(full_tellcorrfilename))
+    if os.path.exists(final_path):
+        outlink = os.path.join(specdir, os.path.basename(final_path))
         if not os.path.exists(outlink):
-            os.symlink(full_tellcorrfilename, outlink)
+            os.symlink(final_path, outlink)
         if os.path.exists(outlink):
-            logger.info('Linked %s -> %s', full_tellcorrfilename, outlink)
+            logger.info('Linked %s -> %s', final_path, outlink)
             return outlink
     return None
 
@@ -1002,6 +1036,80 @@ def post_slack_results(
     slack_utils.post_slack_files(client, file_ids, message, channel)
 
 
+def _parse_snid_sage_summary(text: str) -> dict[str, str] | None:
+    """Parse the SNID-SAGE classification summary block at the top of ``.output``."""
+    for line in text.splitlines():
+        ls = line.strip()
+        if not ls.startswith('|') or 'Type' in ls or set(ls.replace('|', '').strip()) <= {'-'}:
+            continue
+        parts = [p.strip() for p in ls.strip('|').split('|')]
+        if len(parts) < 5:
+            continue
+        typ, subtype, z, z_err, age = parts[:5]
+        if typ.lower() == 'type':
+            continue
+        return {
+            'type': typ,
+            'subtype': subtype,
+            'redshift': z,
+            'redshift_err': z_err,
+            'age_days': age,
+        }
+    return None
+
+
+def _log_snid_sage_results(
+    filepath: str,
+    result_file: str,
+    logpath: str,
+    out: dict[str, Any],
+    *,
+    ran_identify: bool,
+) -> None:
+    """Emit a concise SNID summary to the pipeline log (stdout is redirected during identify)."""
+    basename = os.path.basename(filepath)
+    if ran_identify:
+        logger.info('SNID SAGE finished for %s (log: %s)', basename, logpath)
+    else:
+        logger.info('SNID SAGE reusing cached results for %s', basename)
+
+    summary: dict[str, str] | None = None
+    if os.path.exists(result_file):
+        with open(result_file, encoding='utf-8', errors='replace') as handle:
+            summary = _parse_snid_sage_summary(handle.read())
+
+    if summary:
+        logger.info(
+            'SNID classification for %s: %s %s  z=%s±%s  age=%s d',
+            basename,
+            summary['type'],
+            summary['subtype'],
+            summary['redshift'],
+            summary['redshift_err'],
+            summary['age_days'],
+        )
+    else:
+        logger.warning('SNID produced no parseable summary for %s (%s)', basename, result_file)
+
+    tbl = out.get('results')
+    if tbl is not None and len(tbl) > 0:
+        top = tbl[0]
+        logger.info(
+            'SNID top template for %s: %s (%s %s)  z=%s  RLAP=%s  age=%s d',
+            basename,
+            top['name'],
+            top['type'],
+            top['subtype'],
+            top['redshift'],
+            top['rlap-ccc'],
+            top['age'],
+        )
+
+    plot = out.get('plot')
+    if plot:
+        logger.info('SNID plot for %s: %s', basename, plot)
+
+
 def _parse_snid_sage_output_pypi(text: str) -> Table | None:
     """Parse PyPI ``snid-sage`` text ``.output`` (TEMPLATE MATCHES table)."""
     if 'TEMPLATE MATCHES' not in text:
@@ -1082,6 +1190,7 @@ def _run_snid_sage_identify_in_process(filepath: str, results_dir: str, logpath:
     appended to ``logpath``.
     """
     try:
+        pypeit_invoke.ensure_headless_matplotlib()
         import matplotlib
 
         matplotlib.use('Agg')
@@ -1151,9 +1260,10 @@ def run_snid_sage(filepath: str) -> dict[str, Any]:
     os.makedirs(results_dir, exist_ok=True)
     logpath = os.path.join(results_dir, basename.replace('.fits', '.log'))
 
+    ran_identify = False
     if not os.path.exists(result_file):
         try:
-            _run_snid_sage_identify_in_process(filepath, results_dir, logpath)
+            ran_identify = _run_snid_sage_identify_in_process(filepath, results_dir, logpath) == 0
         except ImportError as exc:
             logger.error('snid-sage is required for --snid: %s', exc)
             return {'results': None, 'plot': None}
@@ -1165,6 +1275,8 @@ def run_snid_sage(filepath: str) -> dict[str, Any]:
 
     if os.path.exists(spec_plot):
         out['plot'] = spec_plot
+
+    _log_snid_sage_results(filepath, result_file, logpath, out, ran_identify=ran_identify)
 
     return out
 

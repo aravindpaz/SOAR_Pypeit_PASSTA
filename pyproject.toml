@@ -42,14 +42,20 @@ goodman-spec-download = "passta.spec_download:main"
 goodman-pypeit-reduce = "passta.pypeit_reduce:main"
 goodman-pypeit-reduce-toos = "passta.pypeit_reduce_toos:main"
 goodman-file-organize = "passta.file_organize:main"
+goodman-pypeit-tellfit = "passta.tellfit.cli:main"
 passta-install-telluric-pca = "passta.install_telluric_pca:main"
+passta-check-pypeit-files = "passta.pypeit_files:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["passta*"]
 
 [tool.setuptools.package-data]
-passta = ["caldb/*.txt", "caldb/*.fits", "config/*.par"]
+passta = ["caldb/*.txt", "caldb/*.fits", "config/*.par", "data/telluric/*.fits"]
 
 [tool.setuptools_scm]
 version_file = "passta/_version.py"

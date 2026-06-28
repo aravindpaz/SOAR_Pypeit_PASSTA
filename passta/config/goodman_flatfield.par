@@ -1,5 +1,5 @@
 # Goodman red/blue defaults (400_M1 / 400_M2 and shared setups).
-# Blue-end ghost mitigation (3580–3720 A): enable pixel flat below 3800 A with
+# Blue-end ghost mitigation (3580-3720 A): enable pixel flat below 3800 A with
 # finer B-spline sampling (see test_data/ghost_correction/ benchmarks).
 [calibrations]
 [[flatfield]]

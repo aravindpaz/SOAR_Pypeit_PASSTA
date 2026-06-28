@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os
+
+# Must be set before matplotlib is imported (parallel reductions + QA plots).
+os.environ.setdefault('MPLBACKEND', 'Agg')
+
 import argparse
 import contextlib
 import copy
@@ -13,10 +18,98 @@ from pathlib import Path
 from typing import Any
 
 from passta.pypeit_msgs_bridge import pypeit_logging_bridge
+from passta import astropy_iers as _astropy_iers  # noqa: F401 — IERS patch
+from passta import pypeit_files as _pypeit_files  # noqa: F401 — InputFile read patch
+from passta.pypeit_files import sanitize_pypeit_file, sanitize_pypeit_files
 
 logger = logging.getLogger(__name__)
 
 _GOODMAN_SPEC_PREFIX = 'soar_goodman'
+_pypeit_standard_utf8_patch_applied = False
+_arc_fit_qa_patch_applied = False
+_headless_matplotlib_applied = False
+
+
+def ensure_headless_matplotlib() -> None:
+    """Use the non-interactive Agg backend (safe with ``--jobs`` > 1)."""
+    global _headless_matplotlib_applied
+    os.environ.setdefault('MPLBACKEND', 'Agg')
+    try:
+        import matplotlib
+
+        if matplotlib.get_backend().lower() != 'agg':
+            matplotlib.use('Agg', force=True)
+    except Exception:
+        pass
+    _headless_matplotlib_applied = True
+
+
+def _ensure_pypeit_arc_fit_qa_patch() -> None:
+    """Skip arc wavelength QA plots when matplotlib mathtext/layout fails."""
+    global _arc_fit_qa_patch_applied
+    if _arc_fit_qa_patch_applied:
+        return
+    import functools
+
+    from pypeit.core.wavecal import autoid
+
+    _orig_arc_fit_qa = autoid.arc_fit_qa
+
+    @functools.wraps(_orig_arc_fit_qa)
+    def _safe_arc_fit_qa(*args: Any, **kwargs: Any) -> None:
+        ensure_headless_matplotlib()
+        try:
+            _orig_arc_fit_qa(*args, **kwargs)
+        except ValueError:
+            logger.warning(
+                'PypeIt arc_fit_qa failed (mathtext/layout); skipping wavelength QA plot',
+                exc_info=True,
+            )
+            try:
+                import matplotlib.pyplot as plt
+
+                plt.close('all')
+            except Exception:
+                pass
+
+    autoid.arc_fit_qa = _safe_arc_fit_qa
+    _arc_fit_qa_patch_applied = True
+
+
+def _ensure_pypeit_standard_info_utf8_patch() -> None:
+    """Normalize PypeIt standard catalog text files to ASCII (en-dash breaks Table.read)."""
+    global _pypeit_standard_utf8_patch_applied
+    if _pypeit_standard_utf8_patch_applied:
+        return
+
+    from pathlib import Path
+
+    import pypeit
+
+    standards_root = Path(pypeit.__file__).resolve().parent / 'data' / 'standards'
+    if not standards_root.is_dir():
+        _pypeit_standard_utf8_patch_applied = True
+        return
+
+    replacements = (
+        (b'\xe2\x80\x93', b'-'),  # en-dash
+        (b'\xe2\x80\x94', b'-'),  # em-dash
+    )
+    for path in standards_root.rglob('*_info.txt'):
+        raw = path.read_bytes()
+        fixed = raw
+        for old, new in replacements:
+            fixed = fixed.replace(old, new)
+        if fixed != raw:
+            path.write_bytes(fixed)
+            logger.info('Normalized non-ASCII punctuation in %s', path)
+
+    _pypeit_standard_utf8_patch_applied = True
+
+
+ensure_headless_matplotlib()
+_ensure_pypeit_standard_info_utf8_patch()
+_ensure_pypeit_arc_fit_qa_patch()
 
 
 def goodman_flatfield_param_file() -> str | None:
@@ -28,6 +121,18 @@ def goodman_flatfield_param_file() -> str | None:
     except (ModuleNotFoundError, TypeError, FileNotFoundError):
         pass
     fallback = Path(__file__).resolve().parent / 'config' / 'goodman_flatfield.par'
+    return str(fallback) if fallback.is_file() else None
+
+
+def goodman_telluric_param_file() -> str | None:
+    """Path to packaged Goodman telluric PypeIt parameter block, if present."""
+    try:
+        path = resources.files('passta').joinpath('config/goodman_telluric.par')
+        if path.is_file():
+            return str(path)
+    except (ModuleNotFoundError, TypeError, FileNotFoundError):
+        pass
+    fallback = Path(__file__).resolve().parent / 'config' / 'goodman_telluric.par'
     return str(fallback) if fallback.is_file() else None
 
 
@@ -252,6 +357,7 @@ def run_setup(
         :func:`passta.pypeit_reduce.run_reduction` so setup and ``run_pypeit`` share
         the same compatibility window.
     """
+    ensure_headless_matplotlib()
     from pypeit.scripts.setup import Setup
 
     param_block_file = None
@@ -296,6 +402,9 @@ def run_setup(
     _log_pypeit_cli('pypeit_setup', *setup_argv)
     with pypeit_logging_bridge(logger):
         Setup.main(args)
+    n_fixed = sanitize_pypeit_files(sorted(Path(output_path).rglob('*.pypeit')))
+    if n_fixed:
+        logger.info('Normalized %s .pypeit file(s) to ASCII after setup', n_fixed)
 
 
 def run_pypeit(
@@ -303,6 +412,8 @@ def run_pypeit(
     redux_path: str,
 ) -> None:
     """Run :class:`pypeit.scripts.run_pypeit.RunPypeIt` (``run_pypeit``)."""
+    ensure_headless_matplotlib()
+    sanitize_pypeit_file(pypeit_file)
     from pypeit.scripts.run_pypeit import RunPypeIt
 
     args = argparse.Namespace(
@@ -403,29 +514,22 @@ def run_tellfit(
     *,
     objmodel: str = 'poly',
     par_outfile: str = 'telluric.par',
+    tell_file: str | None = None,
     chk_version: bool = False,
 ) -> None:
-    """Run :class:`pypeit.scripts.tellfit.TellFit` (``pypeit_tellfit``)."""
-    from pypeit.scripts.tellfit import TellFit
+    """Run PASSTA telluric fitting (:func:`passta.tellfit.run_tellfit`)."""
+    from passta.tellfit import run_tellfit as _run_tellfit
 
-    args = argparse.Namespace(
-        spec1dfile=spec1d_or_coadd,
-        objmodel=objmodel,
-        redshift=None,
-        tell_grid=None,
-        pca_file=None,
-        tell_file=None,
-        debug=False,
-        plot=False,
-        par_outfile=par_outfile,
-        chk_version=chk_version,
-        verbosity=pypeit_verbosity(),
-        log_file=None,
-        log_level=None,
-    )
     tell_argv = [spec1d_or_coadd, '--objmodel', objmodel, '--par_outfile', par_outfile]
+    if tell_file:
+        tell_argv.extend(['--tell_file', tell_file])
     if chk_version:
         tell_argv.append('--chk_version')
-    _log_pypeit_cli('pypeit_tellfit', *tell_argv)
-    with pypeit_logging_bridge(logger):
-        TellFit.main(args)
+    _log_pypeit_cli('goodman-pypeit-tellfit', *tell_argv)
+    _run_tellfit(
+        spec1d_or_coadd,
+        objmodel=objmodel,
+        par_outfile=par_outfile,
+        tell_file=tell_file,
+        chk_version=chk_version,
+    )
