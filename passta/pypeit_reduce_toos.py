@@ -98,6 +98,15 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
             '(default: pass ``--try_old``, skipping version checks).'
         ),
     )
+    parser.add_argument(
+        '--overwrite',
+        default=False,
+        action='store_true',
+        help=(
+            'Force PypeIt re-setup/re-reduce and regenerate flux/coadd/SNID products even when '
+            'outputs already exist.'
+        ),
+    )
     parser.set_defaults(try_old=True)
     add_logging_arguments(parser)
     args = parser.parse_args(argv)
@@ -136,6 +145,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             frame_extension=args.frame_extension,
             slit_pos=args.slit_pos,
             try_old=args.try_old,
+            overwrite=args.overwrite,
         )
 
 

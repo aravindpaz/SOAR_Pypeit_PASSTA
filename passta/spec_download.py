@@ -230,7 +230,7 @@ def _ensure_lco_archive_auth(lco: LCOGT) -> None:
 
 
 def _parse_gdrive_folder_id(url_or_id: str) -> str:
-    """Return a Drive folder id from a full ``folders/…`` URL or from a bare id string."""
+    """Return a Drive folder id from a full ``folders/...`` URL or from a bare id string."""
     s = url_or_id.strip()
     m = re.search(r'/drive/(?:u/\d+/)?folders/([^/?&#]+)', s)
     if m:
@@ -451,7 +451,7 @@ def download_gdrive_toos(
         logger.info(
             'Skipping %s item(s) at the Drive folder root (not under a subdirectory): %s',
             len(loose),
-            ', '.join(loose[:12]) + (' …' if len(loose) > 12 else ''),
+            ', '.join(loose[:12]) + (' ...' if len(loose) > 12 else ''),
         )
 
     for root in sorted(by_root):

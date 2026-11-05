@@ -399,7 +399,7 @@ class LCOGT:
         funpack=True, max_tries=5):
         """Download spectral calibration frames near a date for a telescope/site.
 
-        Queries LAMPFLAT and ARC frames in a ±1 day window, then downloads them.
+        Queries LAMPFLAT and ARC frames in a +/-1 day window, then downloads them.
 
         Parameters
         ----------

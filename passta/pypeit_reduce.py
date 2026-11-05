@@ -170,7 +170,7 @@ def _infer_frame_extension(raw_dir: str, preferred: str = '.fits') -> str:
 
 
 def _goodman_frame_header_hdu_index(hdulist: fits.HDUList, path: str) -> int:
-    """HDU index whose header carries Goodman science keys (``WAVMODE``, ``OBSTYPE``, …).
+    """HDU index whose header carries Goodman science keys (``WAVMODE``, ``OBSTYPE``, ...).
 
     SOAR Goodman **uncompressed** ``.fits`` from the archive or Drive are often
     single-extension (metadata on HDU 0). **fpacked** ``.fz`` products are typically
@@ -289,6 +289,13 @@ def _pypeit_files_in_objdir(spec: str, objdir: str) -> list[str]:
 
 
 def _pypeit_science_products_missing(science_dir: str, pypeit_table: Any) -> bool:
+    """True when any science frame lacks a ``spec1d_*.txt`` product.
+
+    This catches the common Goodman failure mode where PypeIt writes a ``spec2d``
+    (and may even set ``FINDOBJ``) but optimal extraction yields no 1D spectrum.
+    Incomplete Science trees must force a re-reduce **and** a coadd rebuild so a
+    later-recovered exposure is not left out of a stale 2-of-N coadd.
+    """
     if not os.path.isdir(science_dir):
         return True
     for row in pypeit_table.data:
@@ -298,6 +305,31 @@ def _pypeit_science_products_missing(science_dir: str, pypeit_table: Any) -> boo
         if not glob.glob(os.path.join(science_dir, f'spec1d_{framebase}*.txt')):
             return True
     return False
+
+
+def _count_pypeit_science_frames(pypeit_table: Any) -> int:
+    return sum(1 for row in pypeit_table.data if row['frametype'] == 'science')
+
+
+def _coadd_list_matches_objdata(coadd_filename: str, objdata: list[tuple[Any, ...]]) -> bool:
+    """Return True when an existing ``.coadd1d`` already lists the same spec1d/obj_id rows."""
+    if not os.path.exists(coadd_filename):
+        return False
+    expected_norm = [
+        ' '.join(f'{_spec1d_as_fits(obj[0])} | {obj[1]}'.split()) for obj in objdata
+    ]
+    try:
+        with open(coadd_filename, encoding='utf-8', errors='replace') as handle:
+            lines = [ln.strip() for ln in handle]
+    except OSError:
+        return False
+    data_rows = []
+    for ln in lines:
+        if not ln or ln.lower().startswith('filename') or ln.lower().startswith('coadd1d'):
+            continue
+        if '.fits' in ln and '|' in ln:
+            data_rows.append(' '.join(ln.split()))
+    return data_rows == expected_norm
 
 
 # Goodman lamp cards used by PypeIt ``SOARGoodmanSpectrograph.lamps`` / ``check_frame_type``.
@@ -591,6 +623,16 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
             '(default: pass ``--try_old``, skipping version checks).'
         ),
     )
+    parser.add_argument(
+        '--overwrite',
+        default=False,
+        action='store_true',
+        help=(
+            'Force PypeIt re-setup/re-reduce and regenerate flux/coadd products even when '
+            'Science outputs already exist. Incomplete reductions (spec2d without spec1d) '
+            'are always re-run with overwrite.'
+        ),
+    )
     parser.set_defaults(try_old=True)
     add_logging_arguments(parser)
     args = parser.parse_args(argv)
@@ -609,8 +651,23 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def _pypeit_setup_objdir(spec: str, objdir: str, frame_extension: str = '.fits') -> None:
-    """Run PypeIt setup for one reduction directory via :mod:`passta.pypeit_invoke`."""
+def _pypeit_setup_objdir(
+    spec: str,
+    objdir: str,
+    frame_extension: str = '.fits',
+    *,
+    overwrite: bool = False,
+) -> None:
+    """Run PypeIt setup for one reduction directory via :mod:`passta.pypeit_invoke`.
+
+    When ``overwrite`` is True, remove existing ``{spec}_*`` setup directories so the
+    packaged Goodman parameter block (flat-field / findobj / extraction) is re-applied.
+    """
+    if overwrite:
+        for setup_dir in sorted(glob.glob(os.path.join(objdir, f'{spec}_*'))):
+            if os.path.isdir(setup_dir):
+                logger.info('Removing setup directory for overwrite: %s', setup_dir)
+                shutil.rmtree(setup_dir)
     pypeit_invoke.run_setup(spec, objdir, objdir, extension=frame_extension)
 
 
@@ -620,27 +677,74 @@ def _pypeit_reduce_objdir(
     caldb_dir: str,
     *,
     slit_pos: float = 505.0,
-) -> list[tuple[Any, ...]]:
-    """Run PypeIt reduction if needed and return science rows from :func:`parse_pypeit_output`."""
+    overwrite: bool = False,
+) -> tuple[list[tuple[Any, ...]], bool]:
+    """Run PypeIt reduction if needed and return science rows from :func:`parse_pypeit_output`.
+
+    Returns
+    -------
+    objdata, force_rebuild_coadd
+        ``force_rebuild_coadd`` is True when Science products were incomplete and a
+        re-reduce recovered frames that a stale coadd might still omit.
+    """
     pypeit_files = _pypeit_files_in_objdir(spec, objdir)
     if not pypeit_files:
         logger.error('pypeit_setup failed or missing .pypeit for %s', objdir)
-        return []
+        return [], False
 
     science_dir = os.path.join(objdir, 'Science')
     objdata: list[tuple[Any, ...]] = []
+    force_rebuild_coadd = False
     for pypeit_file in pypeit_files:
         pypeit_file_io.sanitize_pypeit_file(pypeit_file)
         pypeit_table = inputfiles.PypeItFile.from_file(pypeit_file)
         setup = os.path.basename(os.path.dirname(pypeit_file))
-        if _pypeit_science_products_missing(science_dir, pypeit_table):
-            pypeit_invoke.run_pypeit(pypeit_file, objdir)
+        n_science = _count_pypeit_science_frames(pypeit_table)
+        missing = _pypeit_science_products_missing(science_dir, pypeit_table)
+        if overwrite or missing:
+            if missing and not overwrite:
+                logger.warning(
+                    'Incomplete Science products for %s (%s); re-running to recover '
+                    'missing extractions (will force coadd rebuild)',
+                    objdir,
+                    setup,
+                )
+                force_rebuild_coadd = True
+            # Full overwrite must rebuild flats too: packaged Goodman flatfield /
+            # findobj / extraction params live in the .pypeit file and only take
+            # effect when Calibrations are regenerated.
+            if overwrite:
+                force_rebuild_coadd = True
+                calib_dir = os.path.join(objdir, 'Calibrations')
+                if os.path.isdir(calib_dir):
+                    logger.info('Removing Calibrations for overwrite: %s', calib_dir)
+                    shutil.rmtree(calib_dir)
+                qa_dir = os.path.join(objdir, 'QA')
+                if os.path.isdir(qa_dir):
+                    shutil.rmtree(qa_dir)
+                if os.path.isdir(science_dir):
+                    logger.info('Removing Science for overwrite: %s', science_dir)
+                    shutil.rmtree(science_dir)
+            pypeit_invoke.run_pypeit(
+                pypeit_file,
+                objdir,
+                overwrite=True,
+                reuse_calibs=not overwrite,
+            )
         else:
             logger.info('Reduction already done for %s (%s)', objdir, setup)
-        objdata.extend(
-            parse_pypeit_output(science_dir, pypeit_table, caldb_dir, slit_pos=slit_pos)
-        )
-    return objdata
+        recovered = parse_pypeit_output(science_dir, pypeit_table, caldb_dir, slit_pos=slit_pos)
+        if n_science and len(recovered) < n_science:
+            logger.error(
+                'Only %s/%s science frames have usable 1D traces for %s (%s); '
+                'coadd will omit incomplete extractions',
+                len(recovered),
+                n_science,
+                objdir,
+                setup,
+            )
+        objdata.extend(recovered)
+    return objdata, force_rebuild_coadd
 
 
 def parse_pypeit_output(
@@ -799,8 +903,12 @@ def make_flux_file(objdata: list[tuple[Any, ...]], fullsensfile: str) -> str | N
     with open(flux_filename, 'w') as f:
         # ``extrap_sens`` allows science wavelengths outside the std sensfunc grid (e.g. Goodman
         # coverage bluer than the standard); otherwise ``pypeit_flux_calib`` raises PypeItError.
+        # ``extinct_correct`` must match the UVIS sensfunc default (True): the packaged
+        # sensitivity functions are built with extinction-corrected standards, so science
+        # frames need the same correction or the blue continuum is systematically tilted.
         f.write('[fluxcalib] \n')
-        f.write('  extinct_correct = False \n')
+        f.write('  extinct_correct = True \n')
+        f.write('  extinct_file = closest \n')
         f.write('  extrap_sens = True \n\n')
         f.write('flux read \n')
         f.write(f'  path {dirname} \n')
@@ -850,8 +958,10 @@ def pypeit_post_process(
     caldb_dir: str,
     *,
     try_old: bool = True,
+    overwrite: bool = False,
+    force_rebuild_coadd: bool = False,
 ) -> str | None:
-    """Flux-calibrate, coadd, and symlink the final 1D spectrum.
+    """Flux-calibrate, coadd, clean the blue end, and symlink the final 1D spectrum.
 
     Telluric correction is disabled in the pipeline (see ``passta.tellfit``);
     run ``goodman-pypeit-tellfit`` on the coadd when needed.
@@ -864,6 +974,14 @@ def pypeit_post_process(
         Directory where the coadd FITS symlink is created.
     caldb_dir : str
         Location of ``caldb.txt`` and sensitivity functions.
+    try_old : bool, optional
+        Passed to ``pypeit_flux_calib``.
+    overwrite : bool, optional
+        If True, regenerate flux/coadd products even when the coadd FITS exists.
+    force_rebuild_coadd : bool, optional
+        If True, rebuild the coadd even without ``overwrite`` (e.g. after an
+        incomplete Science tree was repaired and newly recovered frames must
+        enter the coadd).
 
     Returns
     -------
@@ -902,13 +1020,41 @@ def pypeit_post_process(
     fullout_1dfilename = os.path.join(dirname, out_1dfilename)
     full_tellcorrfilename = fullout_1dfilename.replace('.fits', '_tellcorr.fits')
 
+    # Detect stale coadds written before a later-recovered exposure existed.
+    existing_coadd_cfg = os.path.join(dirname, f'{target}.coadd1d')
+    stale_coadd = os.path.exists(fullout_1dfilename) and not _coadd_list_matches_objdata(
+        existing_coadd_cfg, objdata
+    )
+    rebuild_coadd = bool(overwrite or force_rebuild_coadd or stale_coadd)
+    if stale_coadd and not (overwrite or force_rebuild_coadd):
+        logger.warning(
+            'Existing coadd for %s lists a different exposure set than current '
+            'extractions (%s frames); rebuilding coadd',
+            target,
+            len(objdata),
+        )
+
     coadd_filename = make_coadd_file(objdata, fullout_1dfilename)
     par_outfile = os.path.join(dirname, 'coadd1d.par')
     if coadd_filename is None:
         return None
 
+    if rebuild_coadd and os.path.exists(fullout_1dfilename):
+        logger.info('Removing existing coadd for rebuild: %s', fullout_1dfilename)
+        os.remove(fullout_1dfilename)
+    if rebuild_coadd and os.path.exists(full_tellcorrfilename):
+        os.remove(full_tellcorrfilename)
+
     if not os.path.exists(fullout_1dfilename):
         pypeit_invoke.run_coadd_1dspec(coadd_filename, par_outfile)
+
+    if os.path.exists(fullout_1dfilename):
+        from passta.spectrum_cleanup import clean_goodman_coadd_blue_end
+
+        try:
+            clean_goodman_coadd_blue_end(fullout_1dfilename, inplace=True)
+        except Exception:
+            logger.exception('Blue-end cleanup failed for %s', fullout_1dfilename)
 
     from passta.tellfit import TELLURIC_CORRECTION_ENABLED
 
@@ -934,6 +1080,12 @@ def pypeit_post_process(
 
     if os.path.exists(final_path):
         outlink = os.path.join(specdir, os.path.basename(final_path))
+        if os.path.islink(outlink) or os.path.exists(outlink):
+            if rebuild_coadd:
+                os.remove(outlink)
+            elif os.path.exists(outlink):
+                logger.info('Linked %s -> %s', final_path, outlink)
+                return outlink
         if not os.path.exists(outlink):
             os.symlink(final_path, outlink)
         if os.path.exists(outlink):
@@ -986,7 +1138,13 @@ def post_slack_results(
         objname = hdu['PRIMARY'].header['TARGET']
 
     res_table = results.get('results')
-    if res_table is not None and len(res_table) > 0:
+    summary = results.get('summary')
+    if summary:
+        best_class = f"{summary.get('type', '?')} {summary.get('subtype', '')}".strip()
+        conf = summary.get('type_confidence')
+        if conf:
+            best_class = f'{best_class} ({conf})'
+    elif res_table is not None and len(res_table) > 0:
         best_class = res_table[0]['subtype']
     else:
         best_class = None
@@ -1038,24 +1196,30 @@ def post_slack_results(
 
 def _parse_snid_sage_summary(text: str) -> dict[str, str] | None:
     """Parse the SNID-SAGE classification summary block at the top of ``.output``."""
+    summary: dict[str, str] | None = None
     for line in text.splitlines():
         ls = line.strip()
-        if not ls.startswith('|') or 'Type' in ls or set(ls.replace('|', '').strip()) <= {'-'}:
-            continue
-        parts = [p.strip() for p in ls.strip('|').split('|')]
-        if len(parts) < 5:
-            continue
-        typ, subtype, z, z_err, age = parts[:5]
-        if typ.lower() == 'type':
-            continue
-        return {
-            'type': typ,
-            'subtype': subtype,
-            'redshift': z,
-            'redshift_err': z_err,
-            'age_days': age,
-        }
-    return None
+        if ls.startswith('|') and 'Type' not in ls and not set(ls.replace('|', '').strip()) <= {'-'}:
+            parts = [p.strip() for p in ls.strip('|').split('|')]
+            if len(parts) >= 5:
+                typ, subtype, z, z_err, age = parts[:5]
+                if typ.lower() != 'type':
+                    summary = {
+                        'type': typ,
+                        'subtype': subtype,
+                        'redshift': z,
+                        'redshift_err': z_err,
+                        'age_days': age,
+                    }
+        # e.g. "Type       Ia          High            Medium (+49.3%, vs Ic)"
+        if summary is not None and ls.lower().startswith('type') and 'vs' in ls.lower():
+            parts = ls.split()
+            # Label MatchQuality Confidence...
+            if len(parts) >= 3:
+                summary['type_match_quality'] = parts[2]
+            if len(parts) >= 4:
+                summary['type_confidence'] = parts[3]
+    return summary
 
 
 def _log_snid_sage_results(
@@ -1080,7 +1244,7 @@ def _log_snid_sage_results(
 
     if summary:
         logger.info(
-            'SNID classification for %s: %s %s  z=%s±%s  age=%s d',
+            'SNID classification for %s: %s %s  z=%s+/-%s  age=%s d',
             basename,
             summary['type'],
             summary['subtype'],
@@ -1183,7 +1347,7 @@ def _parse_snid_sage_output_file(result_file: str) -> Table | None:
 
 
 def _run_snid_sage_identify_in_process(filepath: str, results_dir: str, logpath: str) -> int:
-    """Call **snid-sage**'s CLI entry point in-process (same as ``sage identify …``).
+    """Call **snid-sage**'s CLI entry point in-process (same as ``sage identify ...``).
 
     Uses ``snid_sage.interfaces.cli.main.main`` so behavior matches the installed
     ``sage`` console script without a subprocess. Stdout/stderr from the run are
@@ -1199,6 +1363,9 @@ def _run_snid_sage_identify_in_process(filepath: str, results_dir: str, logpath:
 
     from snid_sage.interfaces.cli.main import main as snid_sage_cli_main
 
+    # Goodman 400_M1/M2: residual blue-end ghost (~3800 A) can dominate the
+    # cross-correlation and flip Ia<->Ic at very low confidence. Mask that band
+    # and the O2 A-band by default; the coadd is also cleaned in-place first.
     argv = [
         '--quiet',
         'identify',
@@ -1206,6 +1373,10 @@ def _run_snid_sage_identify_in_process(filepath: str, results_dir: str, logpath:
         '-o',
         results_dir,
         '--no-progress',
+        '--aband-remove',
+        '--wavelength-masks',
+        '3000:3800',
+        '7550:7700',
     ]
     logger.info('Running SNID SAGE in-process: sage %s', ' '.join(argv))
 
@@ -1232,23 +1403,25 @@ def _run_snid_sage_identify_in_process(filepath: str, results_dir: str, logpath:
     return rc
 
 
-def run_snid_sage(filepath: str) -> dict[str, Any]:
+def run_snid_sage(filepath: str, *, overwrite: bool = False) -> dict[str, Any]:
     """Run **snid-sage** identification on a 1D spectrum and parse outputs.
 
-    Calls the same code path as the ``sage identify … -o`` CLI via
+    Calls the same code path as the ``sage identify ... -o`` CLI via
     :func:`_run_snid_sage_identify_in_process` (no subprocess). Legacy ``.output``
     formats are still parsed if present.
 
     Parameters
     ----------
     filepath : str
-        Telluric-corrected FITS spectrum.
+        Flux-calibrated (optionally telluric-corrected) FITS spectrum.
+    overwrite : bool, optional
+        If True, delete a cached ``.output`` and re-run identify.
 
     Returns
     -------
     dict
-        Keys ``results`` (`~astropy.table.Table` or None) and ``plot`` (path
-        string or None).
+        Keys ``results`` (`~astropy.table.Table` or None), ``summary`` (dict or
+        None), and ``plot`` (path string or None).
     """
     dirpath, basename = os.path.split(filepath)
     results_dir = os.path.join(dirpath, 'results')
@@ -1260,18 +1433,29 @@ def run_snid_sage(filepath: str) -> dict[str, Any]:
     os.makedirs(results_dir, exist_ok=True)
     logpath = os.path.join(results_dir, basename.replace('.fits', '.log'))
 
+    if overwrite and os.path.exists(result_file):
+        os.remove(result_file)
+
     ran_identify = False
     if not os.path.exists(result_file):
         try:
             ran_identify = _run_snid_sage_identify_in_process(filepath, results_dir, logpath) == 0
         except ImportError as exc:
             logger.error('snid-sage is required for --snid: %s', exc)
-            return {'results': None, 'plot': None}
+            return {'results': None, 'summary': None, 'plot': None}
 
-    out: dict[str, Any] = {'results': None, 'plot': None}
+    out: dict[str, Any] = {'results': None, 'summary': None, 'plot': None}
 
     if os.path.exists(result_file):
-        out['results'] = _parse_snid_sage_output_file(result_file)
+        with open(result_file, encoding='utf-8', errors='replace') as handle:
+            text = handle.read()
+        out['summary'] = _parse_snid_sage_summary(text)
+        if 'TEMPLATE MATCHES' in text:
+            out['results'] = _parse_snid_sage_output_pypi(text)
+            if out['results'] is None:
+                out['results'] = _parse_snid_sage_output_legacy(text)
+        else:
+            out['results'] = _parse_snid_sage_output_legacy(text)
 
     if os.path.exists(spec_plot):
         out['plot'] = spec_plot
@@ -1293,6 +1477,7 @@ def run_reduction(
     frame_extension: str | None = None,
     slit_pos: float = 505.0,
     try_old: bool = True,
+    overwrite: bool = False,
 ) -> None:
     """Main driver: symlink raw data, run PypeIt setup and reduction in-process, post-process.
 
@@ -1324,6 +1509,8 @@ def run_reduction(
     try_old : bool, optional
         If True (default), run ``pypeit_flux_calib`` with ``--try_old``. Pass ``--no-try-old``
         on the CLI to enforce ``SpecObj`` datamodel version checks.
+    overwrite : bool, optional
+        Force re-setup, re-reduce, re-flux/coadd, and re-SNID even when products exist.
 
     Notes
     -----
@@ -1441,22 +1628,34 @@ def run_reduction(
         _parallel_each(
             jobs,
             reduction_dirs,
-            lambda od, sp=spec, ext=frame_extension: _pypeit_setup_objdir(sp, od, ext),
+            lambda od, sp=spec, ext=frame_extension, ow=overwrite: _pypeit_setup_objdir(
+                sp, od, ext, overwrite=ow
+            ),
         )
 
         raw_obj = _parallel_map_unordered(
             jobs,
             reduction_dirs,
-            lambda od, sp=spec, cdb=caldb_dir, spos=slit_pos: _pypeit_reduce_objdir(
-                sp, od, cdb, slit_pos=spos
+            lambda od, sp=spec, cdb=caldb_dir, spos=slit_pos, ow=overwrite: _pypeit_reduce_objdir(
+                sp, od, cdb, slit_pos=spos, overwrite=ow
             ),
         )
-    all_objdata: list[list[tuple[Any, ...]]] = [od for od in raw_obj if len(od) > 0]
+    # Each reduce returns (objdata, force_rebuild_coadd).
+    all_objdata: list[tuple[list[tuple[Any, ...]], bool]] = [
+        (od, force) for od, force in raw_obj if len(od) > 0
+    ]
 
     outlinks: list[str | None] = []
-    for objdata in all_objdata:
+    for objdata, force_rebuild in all_objdata:
         outlinks.append(
-            pypeit_post_process(objdata, fullspecdir, caldb_dir, try_old=try_old)
+            pypeit_post_process(
+                objdata,
+                fullspecdir,
+                caldb_dir,
+                try_old=try_old,
+                overwrite=overwrite,
+                force_rebuild_coadd=force_rebuild,
+            )
         )
 
     links_done = [L for L in outlinks if L and os.path.exists(L)]
@@ -1464,7 +1663,7 @@ def run_reduction(
         pairs = _parallel_map_unordered(
             jobs,
             links_done,
-            lambda link: (link, run_snid_sage(link)),
+            lambda link, ow=overwrite: (link, run_snid_sage(link, overwrite=ow)),
         )
         if slack_dry_run or slack:
             by_link = dict(pairs)
@@ -1501,6 +1700,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 frame_extension=args.frame_extension,
                 slit_pos=args.slit_pos,
                 try_old=args.try_old,
+                overwrite=args.overwrite,
             )
     else:
         run_reduction(
@@ -1514,6 +1714,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             frame_extension=args.frame_extension,
             slit_pos=args.slit_pos,
             try_old=args.try_old,
+            overwrite=args.overwrite,
         )
 
 

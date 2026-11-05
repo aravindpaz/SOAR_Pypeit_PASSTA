@@ -22,9 +22,16 @@ SAMPLE_PYPY = textwrap.dedent(
     ---------------------------------------------------------------------------
     | II     | II-87A       | 0.005938 |   0.000872 |    190.6 |        278.1 |
 
+
+    --------------------------------------------------------------
+    Category   Label       Match Quality   Confidence vs next best
+    --------------------------------------------------------------
+    Type       II          High            Medium (+49.3%, vs Ic)
+    Subtype    II-87A      -               High (+120.5% vs II-N)
+
     TEMPLATE MATCHES (from Best Cluster - Auto-Selected):
     ------------------------------------------------------------------------------
-      # Template         Type   Subtype   HσLAP-CCC    Redshift      ±Error    Age
+      # Template         Type   Subtype   HsigmaLAP-CCC    Redshift      +/-Error    Age
     ------------------------------------------------------------------------------
       1 PTF10qts         Ic     Ic-broad       2.67    0.062096    0.005672   -1.2
       2 SN2007gr         Ic     Ic-narrow      2.10    0.061000    0.006000    0.0
@@ -38,6 +45,7 @@ def test_parse_snid_sage_summary():
     assert summary['type'] == 'II'
     assert summary['subtype'] == 'II-87A'
     assert summary['redshift'] == '0.005938'
+    assert summary.get('type_confidence') == 'Medium'
 
 
 def test_parse_snid_sage_output_pypi_table():
@@ -67,7 +75,7 @@ def test_parse_snid_sage_output_legacy_table():
 
 
 def test_goodman_reduce_toos_uses_same_run_snid_sage():
-    """``goodman-pypeit-reduce-toos`` calls ``run_reduction`` → ``run_snid_sage`` (same as reduce)."""
+    """``goodman-pypeit-reduce-toos`` calls ``run_reduction`` -> ``run_snid_sage`` (same as reduce)."""
     import inspect
 
     from passta import pypeit_reduce

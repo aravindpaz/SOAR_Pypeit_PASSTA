@@ -19,8 +19,8 @@ This repository is a companion to general SOAR/PypeIt examples such as [soar_pyp
 - **External tools** on `PATH` where used:
   - **CFITSIO** `fpack` / `funpack` (file organize / some LCO downloads)
   - **PypeIt** CLIs: `pypeit_setup`, `run_pypeit`, `pypeit_sensfunc`, `pypeit_flux_calib`, `pypeit_coadd_1dspec`, `pypeit_tellfit`
-  - Optional: if **`pypeit_tellfit`** times out fetching PCA telluric data from object storage, run **`scripts/install_telluric_pca_from_gdrive.sh`** (after `conda activate …`) to pull **`TellPCA_3000_26000_R15000.fits`** from the PypeIt Telluric [Google Drive](https://drive.google.com/drive/folders/1FFRWjUZ58HiDuDD33MYqBzMWDQanBRRy), **`pypeit_install_telluric --local_file`** it into the cache, then remove the download under **`WORKDIR`** (default repo root) so only the cached copy remains.
-  - **`snid-sage`** (declared in ``pyproject.toml``): supplies the ``sage`` CLI used for ``--snid`` (distinct from **SageMath**’s ``sage``; use a dedicated env if both are installed)
+  - Optional: if **`pypeit_tellfit`** times out fetching PCA telluric data from object storage, run **`scripts/install_telluric_pca_from_gdrive.sh`** (after `conda activate ...`) to pull **`TellPCA_3000_26000_R15000.fits`** from the PypeIt Telluric [Google Drive](https://drive.google.com/drive/folders/1FFRWjUZ58HiDuDD33MYqBzMWDQanBRRy), **`pypeit_install_telluric --local_file`** it into the cache, then remove the download under **`WORKDIR`** (default repo root) so only the cached copy remains.
+  - **`snid-sage`** (declared in ``pyproject.toml``): supplies the ``sage`` CLI used for ``--snid`` (distinct from **SageMath**'s ``sage``; use a dedicated env if both are installed)
   - Optional: **Slack** bot token file for `--slack` (see below)
 
 ## Installation
@@ -122,9 +122,9 @@ goodman-pypeit-reduce 2025-04-15 /path/to/reductions --slack-dry-run
 - **`--snid`**: Runs `sage` on each telluric-corrected coadd under the reduction tree.
 - **`--slack`**: Posts to Slack when combined with `--snid` (requires `SLACK_TOKEN_FILE_PASSTA` pointing to a file containing the bot token).
 - **`--slack-dry-run`**: Runs SNID and builds the same Slack message as a live post, writes `spectra/slack/*.slack.debug`, and logs the text; does not call the Slack API (implies `--snid`). If both `--slack` and `--slack-dry-run` are passed, only the dry-run runs.
-- **`--jobs N`**: Run `pypeit_setup`, `run_pypeit`, and SNID in parallel across independent object directories (default `1`). Try `2`–`4` on a multi-core machine; avoid oversubscribing shared NFS storage.
+- **`--jobs N`**: Run `pypeit_setup`, `run_pypeit`, and SNID in parallel across independent object directories (default `1`). Try `2`-`4` on a multi-core machine; avoid oversubscribing shared NFS storage.
 
-Astropy’s observatory site cache is refreshed **once** at the start of each reduction run (no longer on every import or every object directory).
+Astropy's observatory site cache is refreshed **once** at the start of each reduction run (no longer on every import or every object directory).
 
 ### Logging
 
@@ -155,7 +155,7 @@ Typical end-to-end time is dominated by **PypeIt** (and **SNID** if enabled), no
 
 1. **One download command** with all proposal IDs (`--propid A,B`) instead of two sequential `timeout 600` runs.
 2. **`--download-workers`** (defaults to a small positive number) for overlapping LCO frame downloads; lower it if the archive returns HTTP 429 throttling.
-3. **`goodman-pypeit-reduce --jobs 2`** (or `3`–`4`) when you have several object directories for the same night—each reduction is independent until shared `caldb` updates (sensitivity functions still run sequentially inside each reduction as today).
+3. **`goodman-pypeit-reduce --jobs 2`** (or `3`-`4`) when you have several object directories for the same night-each reduction is independent until shared `caldb` updates (sensitivity functions still run sequentially inside each reduction as today).
 4. **Timeouts**: a single longer download timeout may replace two shorter ones; keep headroom for large nights.
 5. **Skip SNID** on the fastest path (`--snid` off) when classifications are not needed that morning.
 

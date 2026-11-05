@@ -18,8 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from passta.pypeit_msgs_bridge import pypeit_logging_bridge
-from passta import astropy_iers as _astropy_iers  # noqa: F401 — IERS patch
-from passta import pypeit_files as _pypeit_files  # noqa: F401 — InputFile read patch
+from passta import astropy_iers as _astropy_iers  # noqa: F401 - IERS patch
+from passta import pypeit_files as _pypeit_files  # noqa: F401 - InputFile read patch
 from passta.pypeit_files import sanitize_pypeit_file, sanitize_pypeit_files
 
 logger = logging.getLogger(__name__)
@@ -141,7 +141,7 @@ def _goodman_detector_data_hdu_index(hdu: Any) -> int:
 
     PypeIt's Goodman classes assume ``hdu[1]`` (typical fpacked layout). Single-HDU
     archive ``.fits`` only have ``hdu[0]``, which caused ``IndexError`` in
-    ``get_detector_par`` during reduction (e.g. ``bpm`` → ``get_rawimage``).
+    ``get_detector_par`` during reduction (e.g. ``bpm`` -> ``get_rawimage``).
     """
     if hdu is None or len(hdu) == 0:
         return 0
@@ -410,8 +410,21 @@ def run_setup(
 def run_pypeit(
     pypeit_file: str,
     redux_path: str,
+    *,
+    overwrite: bool = False,
+    reuse_calibs: bool = True,
 ) -> None:
-    """Run :class:`pypeit.scripts.run_pypeit.RunPypeIt` (``run_pypeit``)."""
+    """Run :class:`pypeit.scripts.run_pypeit.RunPypeIt` (``run_pypeit``).
+
+    Parameters
+    ----------
+    overwrite
+        If True, re-reduce frames even when Science products already exist.
+        PASSTA enables this automatically when some science frames lack
+        ``spec1d`` products (incomplete prior reductions).
+    reuse_calibs
+        Passed through to PypeIt (default True).
+    """
     ensure_headless_matplotlib()
     sanitize_pypeit_file(pypeit_file)
     from pypeit.scripts.run_pypeit import RunPypeIt
@@ -420,14 +433,17 @@ def run_pypeit(
         pypeit_file=pypeit_file,
         verbosity=pypeit_verbosity(),
         redux_path=redux_path,
-        reuse_calibs=True,
+        reuse_calibs=reuse_calibs,
         show=False,
-        overwrite=False,
+        overwrite=overwrite,
         calib_only=False,
         log_file=None,
         log_level=None,
     )
-    _log_pypeit_cli('run_pypeit', pypeit_file, '-r', redux_path)
+    argv = [pypeit_file, '-r', redux_path]
+    if overwrite:
+        argv.append('-o')
+    _log_pypeit_cli('run_pypeit', *argv)
     with pypeit_logging_bridge(logger):
         RunPypeIt.main(args)
 

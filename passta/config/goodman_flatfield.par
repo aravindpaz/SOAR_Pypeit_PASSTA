@@ -1,17 +1,37 @@
 # Goodman red/blue defaults (400_M1 / 400_M2 and shared setups).
 # Blue-end ghost mitigation (3580-3720 A): enable pixel flat below 3800 A with
-# finer B-spline sampling (see test_data/ghost_correction/ benchmarks).
+# finer B-spline sampling (see test_data/ghost_correction/ benchmarks;
+# winning PypeIt method: 02_fine_bspline).
 [calibrations]
-[[flatfield]]
-pixelflat_min_wave = 3500
-spec_samp_coarse = 40
-spat_samp = 5
-slit_illum_finecorr = False
+    [[flatfield]]
+        pixelflat_min_wave = 3500
+        spec_samp_coarse = 40
+        spat_samp = 5
+        slit_illum_finecorr = False
 [scienceframe]
-[[process]]
-use_illumflat = False
+    [[process]]
+        use_illumflat = False
 [reduce]
-[[skysub]]
-bspline_spacing = 1.0
-no_poly = True
-sky_sigrej = 5.0
+    [[skysub]]
+        bspline_spacing = 1.0
+        no_poly = True
+        sky_sigrej = 5.0
+        # Avoid aborting global sky when object masks eat most of the slit
+        # (common with bright hosts / multi-trace slits).
+        max_mask_frac = 0.95
+    [[findobj]]
+        # Slightly deeper than the PypeIt default (10) so faint SN traces next
+        # to hosts are still found on Goodman long-slit frames.
+        snr_thresh = 5.0
+        # ~2.25" FWHM at 0.3"/pix (Goodman 2x2); used when a Gaussian profile
+        # is adopted via sn_gauss, not as a forced extraction width.
+        find_fwhm = 7.5
+        maxnumber_sci = 10
+    [[extraction]]
+        # Do NOT set use_user_fwhm=True globally: that forces find_fwhm for every
+        # object and undersizes bright-SN extractions. Instead lower sn_gauss so
+        # marginal/failed empirical profiles fall back to a Gaussian of the
+        # measured (or find_fwhm) width and still produce a spec1d.
+        sn_gauss = 3.0
+        boxcar_radius = 1.5
+        use_user_fwhm = False
