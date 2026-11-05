@@ -1,42 +1,91 @@
-# v1.00 2019-05-01: basic code
-# v1.01 2019-09-20: updated to LCO API v3
-# v1.02 2025-08-25: Added NEWFIRM
+"""Las Cumbres Observatory (LCO) portal client.
 
+Provides :class:`LCOGT` for querying the LCO archive and observation-request API,
+downloading frames, and building API v3 observation requests.
+
+Version history
+---------------
+**1.00** (2019-05-01): Initial code.
+
+**1.01** (2019-09-20): Updated to LCO API v3.
+
+**1.02** (2025-08-25): Added NEWFIRM.
+
+Environment variables
+-----------------------
+``LCOGT_USERNAME`` and ``LCOGT_PASSWORD`` are required to authenticate.
+
+Author
+------
+C. D. Kilpatrick
 """
 
-Code for viewing and posting observation requests and viewing and downloading
-data from the LCO portal.
+from __future__ import annotations
 
-Author: C. D. Kilpatrick
-
-"""
-
-# PACKAGES
-import requests
-import warnings
-import os
-import stat
-import json
-import shutil
-import sys
 import copy
+import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import shutil
 import time
-from astropy.time import Time
-from astropy.time import TimeDelta
-from astropy.io import ascii
-from astropy.io import fits
-from astropy.coordinates import SkyCoord
-from astropy import units as u
-from dateutil.parser import parse
-from datetime import datetime, timedelta
-import numpy as np
-
 import warnings
-warnings.filterwarnings('ignore')
+from datetime import datetime, timedelta
 
-class lcogt(object):
+import numpy as np
+import requests
+from astropy import units as u
+from astropy.io import fits
+from astropy.time import Time, TimeDelta
+
+warnings.filterwarnings("ignore")
+
+logger = logging.getLogger(__name__)
+
+
+def _archive_download_to_path(url: str, dest_path: str, max_tries: int, verbose: bool) -> None:
+    """GET ``url`` to ``dest_path``; retry on connection errors; log failures."""
+    if verbose:
+        logger.debug('Downloading from: %s', url)
+    logger.info('Downloading LCOGT file: %s', dest_path)
+    response = None
+    for _ in range(max_tries):
+        try:
+            response = requests.get(url)
+            break
+        except requests.exceptions.ConnectionError:
+            time.sleep(30)
+    if response is not None and response.status_code == 200:
+        try:
+            with open(dest_path, 'wb') as f:
+                f.write(response.content)
+        except OSError:
+            logger.error('Failed to download: %s', dest_path)
+
+
+# LCO archive RLEVEL codes for Goodman spectroscopy (2026 scheme).
+# https://github.com/aravindpaz/SOAR_Pypeit_PASSTA/issues/3
+LCO_RLEVEL_RAW = 0
+LCO_RLEVEL_LEGACY_REDUCED = (25, 26)  # interim pipeline levels before the 2026 scheme
+LCO_RLEVEL_CFZST = 62  # reduced (bias, flat, trim, cosmic)
+LCO_RLEVEL_ECFZST = 63  # extracted 1D spectrum
+LCO_RLEVEL_WECFZST = 64  # wavelength calibrated
+
+# Query all levels that may appear for science / lamp flats; callers should drop
+# pipeline products (cfzst / ecfzst / wecfzst basename prefixes) before download.
+LCO_RLEVEL_SPECTROSCOPY = (
+    LCO_RLEVEL_RAW,
+    *LCO_RLEVEL_LEGACY_REDUCED,
+    LCO_RLEVEL_CFZST,
+    LCO_RLEVEL_ECFZST,
+    LCO_RLEVEL_WECFZST,
+)
+
+
+class LCOGT:
+    """Client for LCO archive queries, downloads, and observation requests."""
+
     def __init__(self):
-
+        """Read ``LCOGT_*`` credentials and initialize archive/request endpoints."""
         uri_base = 'https://observe.lco.global/'
         archive_base = 'https://archive-api.lco.global/'
         self.params = {
@@ -237,8 +286,10 @@ class lcogt(object):
             }
         }
 
-        if ('LCOGT_USERNAME' not in os.environ.keys()) or ('LCOGT_PASSWORD' not in os.environ.keys()):
-            raise Exception('LCOGT_USERNAME and LCOGT_PASSWORD need to be environment variables.')
+        if 'LCOGT_USERNAME' not in os.environ or 'LCOGT_PASSWORD' not in os.environ:
+            raise RuntimeError(
+                'LCOGT_USERNAME and LCOGT_PASSWORD must be set in the environment.'
+            )
 
         self.username = os.environ['LCOGT_USERNAME']
         self.password = os.environ['LCOGT_PASSWORD']
@@ -246,15 +297,38 @@ class lcogt(object):
         self.format = {'token': 'Token {token}'}
 
     def get_username_password(self):
-        if (self.username is not None and self.password is not None):
-            return(self.username, self.password)
-        else:
-            # Get username password out of shibboleth
-            return(None, None)
+        """Return stored LCO credentials if both are set.
+
+        Returns
+        -------
+        tuple[str | None, str | None]
+            ``(username, password)`` or ``(None, None)`` if either is missing.
+        """
+        if self.username is not None and self.password is not None:
+            return (self.username, self.password)
+        return (None, None)
 
     def get_token_header(self, username, password, auth_type='archive',
         max_tries=4):
+        """Build an ``Authorization`` header for the archive or request API.
 
+        Parameters
+        ----------
+        username : str or None
+            LCO username; if None, no header is produced.
+        password : str or None
+            LCO password.
+        auth_type : {'archive', 'request'}, optional
+            Which API token to use (default ``'archive'``).
+        max_tries : int, optional
+            Retries on connection errors when fetching a new token (default 4).
+
+        Returns
+        -------
+        dict or None
+            Header mapping ``{'Authorization': 'Token ...'}``, or None if
+            authentication fails or ``auth_type`` is invalid.
+        """
         # Check that we're getting the right token
         if auth_type not in self.params['uri'].keys():
             return(None)
@@ -291,100 +365,161 @@ class lcogt(object):
                 return(header)
             else:
                 # There was some problem with authentication/connection
-                return(None)
+                return None
 
-    # Download spectral calibration files for a specific telid and date
+    def _archive_frames_request(self, params, headers, max_tries=5):
+        """GET the archive ``frames`` endpoint with retries on connection errors.
+
+        Parameters
+        ----------
+        params : dict
+            Query parameters for ``/frames/``.
+        headers : dict or None
+            Request headers including authorization.
+        max_tries : int, optional
+            Maximum attempts (default 5).
+
+        Returns
+        -------
+        requests.Response or None
+            HTTP response, or None if every attempt raised ``ConnectionError``.
+        """
+        url = self.params['uri']['archive']['frames']
+        for i in range(max_tries):
+            try:
+                return requests.get(url, params=params, headers=headers)
+            except requests.exceptions.ConnectionError:
+                logger.warning('Timeout on archive frames request, try=%s.', i + 1)
+                if i + 1 < max_tries:
+                    logger.info('Sleeping 30s before retry...')
+                    time.sleep(30)
+        return None
+
     def get_spectral_calibrations(self, date, telid, site, outrootdir='',
         funpack=True, max_tries=5):
+        """Download spectral calibration frames near a date for a telescope/site.
 
-        # Get username and password
-        username,password = self.get_username_password()
+        Queries LAMPFLAT and ARC frames in a +/-1 day window, then downloads them.
 
-        # Get authorization token
+        Parameters
+        ----------
+        date : `astropy.time.Time`
+            Reference date.
+        telid : str
+            Telescope identifier (e.g. ``'4m0a'``).
+        site : str
+            Site identifier passed to the archive API.
+        outrootdir : str, optional
+            Output directory for downloads (default current directory).
+        funpack : bool, optional
+            Passed to :meth:`download_obslist` (default True).
+        max_tries : int, optional
+            Retries per archive GET (default 5).
+
+        Notes
+        -----
+        Requires valid LCO credentials and archive authorization.
+        """
+        username, password = self.get_username_password()
         headers = self.get_token_header(username, password)
 
-        params = {'limit': 100}
-        results = []
-        params['TELID'] = telid
-        params['SITEID'] = site
+        params = {'limit': 100, 'TELID': telid, 'SITEID': site}
         delta = TimeDelta(1, format='jd')
-        params['start'] = (date-delta).datetime.strftime(self.params['date_format'])
-        params['end'] = (date+delta).datetime.strftime(self.params['date_format'])
+        fmt = self.params['date_format']
+        params['start'] = (date - delta).datetime.strftime(fmt)
+        params['end'] = (date + delta).datetime.strftime(fmt)
 
-        # First check for LAMPFLATs
-        params['OBSTYPE'] = 'LAMPFLAT'
-        i=0
-        while True:
-            i=i+1
-            try:
-                response = requests.get(self.params['uri']['archive']['frames'],
-                    params=params, headers=headers)
-                break
-            except requests.exceptions.ConnectionError:
-                # Could be the API throttling us - let's retry up to 5 times
-                print(f'Timeout on requesting spectral calibrations, try={i}.')
-                if i<max_tries:
-                    print('Sleep for 30s and try again...')
-                    time.sleep(30)
-                else:
-                    print(f'Reached max tries={max_tries}')
-                    break
+        results = []
+        for obstype in ('LAMPFLAT', 'ARC'):
+            params['OBSTYPE'] = obstype
+            response = self._archive_frames_request(params, headers, max_tries=max_tries)
+            if response is None:
+                continue
+            if response.status_code != 200:
+                logger.warning('Archive HTTP error body: %s', response.text[:4000])
+            else:
+                results += response.json()['results']
 
-        if response.status_code != 200:
-            print(response.text)
-        else:
-            data = response.json()
-            results += data['results']
+        self.download_obslist(
+            results,
+            outrootdir=outrootdir,
+            use_basename=True,
+            skip_header=True,
+            funpack=funpack,
+        )
 
-        # Now check for ARCs
-        params['OBSTYPE'] = 'ARC'
-        i=0
-        while True:
-            i=i+1
-            try:
-                response = requests.get(self.params['uri']['archive']['frames'],
-                    params=params, headers=headers)
-                break
-            except requests.exceptions.ConnectionError:
-                # Could be the API throttling us - let's retry up to 5 times
-                print(f'Timeout on requesting spectral calibrations, try={i}.')
-                if i<max_tries:
-                    print('Sleep for 30s and try again...')
-                    time.sleep(30)
-                else:
-                    print(f'Reached max tries={max_tries}')
-                    break
+    @staticmethod
+    def _frame_row_matches(row, telid, obstype, rlevel):
+        """Return True if an archive frame row passes telid/obstype/rlevel filters."""
+        if telid is not None:
+            if isinstance(telid, (str, bytes)):
+                telids = (telid,)
+            else:
+                telids = telid
+            if row['TELID'] not in telids:
+                return False
+        if obstype is not None and row['configuration_type'] != obstype:
+            return False
+        if rlevel is None:
+            return True
+        if isinstance(rlevel, (list, tuple)):
+            return row['RLEVEL'] in rlevel
+        return row['RLEVEL'] == rlevel
 
-        if response.status_code != 200:
-            print(response.text)
-        else:
-            data = response.json()
-            results += data['results']
+    def _extend_filtered_results(self, results, payload, telid, obstype, rlevel):
+        """Append filtered frame dicts from a decoded JSON ``payload`` to ``results``."""
+        for row in payload.get('results', []):
+            if self._frame_row_matches(row, telid, obstype, rlevel):
+                results.append(row)
 
-        # Now try to download the obslist
-        self.download_obslist(results, outrootdir=outrootdir,
-            use_basename=True, skip_header=True, funpack=funpack)
-
-    # Get a json object with complete list of observations.  Optional to define
-    # a program or date range to narrow search
     def get_obslist(self, propid=None, sdate=None, edate=None, telid=None,
         obstype=None, rlevel=91, obj=None, reqnum=None, ra=None, dec=None,
         public=False, max_tries=5):
+        """Query the LCO archive for frames matching optional constraints.
 
-        # Get username and password
-        username,password = self.get_username_password()
+        Parameters
+        ----------
+        propid : sequence of str or str or None
+            Proposal ID(s). A single string is treated as one ID. If omitted,
+            all proposals matching other filters are returned (subject to API
+            limits).
+        sdate, edate : `astropy.time.Time` or None
+            Optional start/end window (UTC, formatted per LCO API).
+        telid : str, sequence, or None
+            If set, keep only rows whose ``TELID`` is contained in this value
+            (same membership semantics as the original implementation).
+        obstype : str or None
+            ``OBSTYPE`` query parameter and/or filter on ``configuration_type``.
+        rlevel : int, sequence of int, or None
+            Reduction level filter; if a list, any listed level matches.
+        obj : str or None
+            Object name filter (``OBJECT`` query parameter).
+        reqnum : str or None
+            Request number filter.
+        public : bool, optional
+            If True, request public data only (default False).
+        max_tries : int, optional
+            Retries per HTTP GET on connection errors (default 5).
 
-        # Get authorization token
+        Returns
+        -------
+        list of dict
+            Archive frame metadata records passing the filters.
+        """
+        username, password = self.get_username_password()
         headers = self.get_token_header(username, password)
 
-        # Get parameters for request
         params = {'limit': 5000}
-        fmt=self.params['date_format']
+        fmt = self.params['date_format']
         results = []
-        propids = []
 
-        if propid is not None:
+        if propid is None:
+            propids = []
+        elif isinstance(propid, (str, bytes)):
+            propids = [propid]
+        else:
             propids = list(propid)
+
         if sdate is not None:
             params['start'] = sdate.datetime.strftime(fmt)
         if edate is not None:
@@ -396,150 +531,116 @@ class lcogt(object):
         if reqnum is not None:
             params['REQNUM'] = reqnum
         if public:
-            params['public']=True
-        if ra and dec:
-            params['covers']='POINT({0} {1})'.format(ra, dec)
+            params['public'] = True
+        if ra is not None and dec is not None:
+            params['covers'] = 'POINT({0} {1})'.format(ra, dec)
 
-        if len(propids)>0:
+        if propids:
             for pid in propids:
-                params['PROPID'] = pid
-
-                # Now do request
-                i=0
-                response = None
-                while True:
-                    i=i+1
-                    try:
-                        response = requests.get(self.params['uri']['archive']['frames'],
-                            params=params, headers=headers)
-                        break
-                    except requests.exceptions.ConnectionError:
-                        # Could be the API throttling us - let's retry up to 5 times
-                        print(f'Timeout on requesting spectral calibrations, try={i}.')
-                        if i<max_tries:
-                            print('Sleep for 30s and try again...')
-                            time.sleep(30)
-                        else:
-                            print(f'Reached max tries={max_tries}')
-                            break
-
-                if response and response.status_code != 200:
-                    print(response.text)
-                else:
-                    data = response.json()
-                    results = []
-
-                    for r in data['results']:
-                        if telid is not None and r['TELID'] not in telid:
-                            continue
-                        if (obstype is not None and r['configuration_type']!=obstype):
-                            continue
-                        if rlevel is not None:
-                            if isinstance(rlevel, list):
-                                if r['RLEVEL'] not in rlevel:
-                                    continue
-                            elif r['RLEVEL']!=rlevel:
-                                continue
-                            
-                        results.append(r)
-
+                q = dict(params)
+                q['PROPID'] = pid
+                response = self._archive_frames_request(q, headers, max_tries=max_tries)
+                if response is None:
+                    continue
+                if response.status_code != 200:
+                    logger.warning('Archive HTTP error body: %s', response.text[:4000])
+                    continue
+                self._extend_filtered_results(results, response.json(), telid, obstype, rlevel)
         else:
-            i=0
-            response = None
-            while True:
-                i=i+1
-                try:
-                    response = requests.get(self.params['uri']['archive']['frames'],
-                        params=params, headers=headers)
-                    break
-                except requests.exceptions.ConnectionError:
-                    # Could be the API throttling us - let's retry up to 5 times
-                    print(f'Timeout on requesting spectral calibrations, try={i}.')
-                    if i<max_tries:
-                        print('Sleep for 30s and try again...')
-                        time.sleep(30)
-                    else:
-                        print(f'Reached max tries={max_tries}')
-                        break
-            if response and response.status_code!=200:
-                print(response.text)
+            response = self._archive_frames_request(params, headers, max_tries=max_tries)
+            if response is None:
+                return results
+            if response.status_code != 200:
+                logger.warning('Archive HTTP error body: %s', response.text[:4000])
             else:
-                data = response.json()
-                for r in data['results']:
-                    if telid is not None and r['TELID'] not in telid:
-                        continue
-                    if (obstype is not None and r['configuration_type']!=obstype):
-                        continue
-                    if rlevel is not None:
-                        if isinstance(rlevel, list):
-                            if r['RLEVEL'] not in rlevel:
-                                continue
-                        elif r['RLEVEL']!=rlevel:
-                            continue
-                        
-                    results.append(r)
+                self._extend_filtered_results(results, response.json(), telid, obstype, rlevel)
 
-        return(results)
+        return results
 
     def get_standardobs(self, sdate=None, telid=None, rlevel=None,
         max_tries=5):
+        """Fetch recent public spectrophotometric standard spectra from the archive.
 
-        # Get username and password
-        username,password = self.get_username_password()
+        Parameters
+        ----------
+        sdate : `astropy.time.Time` or None
+            If None, defaults to 14 days before "now" (with a UTC offset applied
+            as in the original implementation).
+        telid : optional
+            Reserved for compatibility; not applied to results in this method.
+        rlevel : int or None
+            ``RLEVEL`` filter; if falsy, uses ``0``.
+        max_tries : int, optional
+            Retries per archive GET (default 5).
 
-        # Get authorization token
+        Returns
+        -------
+        list of dict
+            Concatenated archive results for a fixed list of standard-star names.
+
+        Notes
+        -----
+        ``telid`` is accepted for API compatibility but frames are not re-filtered
+        by telescope here.
+        """
+        username, password = self.get_username_password()
         headers = self.get_token_header(username, password)
 
-        # Get parameters for request
         params = {'OBSTYPE': 'SPECTRUM', 'public': True}
 
         delta = TimeDelta(14, format='jd')
-        date = Time(datetime.utcnow())+TimeDelta(7*3600*u.s)
-        start = (date-delta).datetime
-        fmt=self.params['date_format']
+        date = Time(datetime.utcnow()) + TimeDelta(7 * 3600 * u.s)
+        start = (date - delta).datetime
+        fmt = self.params['date_format']
 
-        if not sdate: params['start']=start.strftime(fmt)
-        else: params['start']=sdate.datetime.strftime(fmt)
+        if not sdate:
+            params['start'] = start.strftime(fmt)
+        else:
+            params['start'] = sdate.datetime.strftime(fmt)
 
-        if not rlevel: params['RLEVEL']=0
-        else: params['RLEVEL']=rlevel
+        if not rlevel:
+            params['RLEVEL'] = 0
+        else:
+            params['RLEVEL'] = rlevel
 
-        objs=['EGGR274','L745-46A','FEIGE110','HZ 44','BD+284211','GD71']
+        objs = ['EGGR274', 'L745-46A', 'FEIGE110', 'HZ 44', 'BD+284211', 'GD71']
 
-        results=[]
+        results = []
         for obj in objs:
-            params['OBJECT']=obj
-            i=0
-            response = None
-            while True:
-                i=i+1
-                try:
-                    response = requests.get(self.params['uri']['archive']['frames'],
-                        params=params, headers=headers)
-                    break
-                except requests.exceptions.ConnectionError:
-                    # Could be the API throttling us - let's retry up to 5 times
-                    print(f'Timeout on requesting spectral calibrations, try={i}.')
-                    if i<max_tries:
-                        print('Sleep for 30s and try again...')
-                        time.sleep(30)
-                    else:
-                        print(f'Reached max tries={max_tries}')
-                        break
-
-            if response and response.status_code != 200:
-                print(response.text)
+            params['OBJECT'] = obj
+            response = self._archive_frames_request(params, headers, max_tries=max_tries)
+            if response is None:
+                continue
+            if response.status_code != 200:
+                logger.warning('Archive HTTP error body: %s', response.text[:4000])
             else:
-                data = response.json()
-                results += data['results']
+                results += response.json()['results']
 
-        return(results)
+        return results
 
 
     def get_requestgroups(self, propid=None, sdate=None, edate=None,
         obstype=None, itype=None):
+        """Query submitted observation request groups from the LCO request API.
 
-        # Get username and password
+        Parameters
+        ----------
+        propid : str, sequence of str, or None
+            Proposal id(s); a bare string is treated as a single id.
+        sdate, edate : `astropy.time.Time` or None
+            Optional ``created_after`` / ``created_before`` filters.
+        obstype : optional
+            Accepted for API compatibility; unused in the current implementation.
+        itype : str or sequence of str or None
+            If set, only results whose first configuration matches one of these
+            ``instrument_type`` values are kept.
+
+        Returns
+        -------
+        list of dict
+            Aggregated ``results`` entries from the API.
+        """
+        _ = obstype
         username, password = self.get_username_password()
 
         # Get authorization token
@@ -553,8 +654,11 @@ class lcogt(object):
 
         params = {}
         results = []
-        propids = []
-        if propid is not None:
+        if propid is None:
+            propids = []
+        elif isinstance(propid, (str, bytes)):
+            propids = [propid]
+        else:
             propids = list(propid)
         if sdate is not None:
             start = sdate.datetime.strftime(self.params['date_format'])
@@ -583,7 +687,20 @@ class lcogt(object):
         return(results)
 
     def sanitize_objname(self, target):
+        """Normalize a source name for filesystem-safe strings (PASSTA convention).
 
+        Parameters
+        ----------
+        target : str
+            Raw ``OBJECT`` string.
+
+        Returns
+        -------
+        str
+            Lowercased name with common transient prefixes removed, whitespace
+            stripped, and characters ``' '``, ``'('``, ``')'``, ``'/'`` replaced
+            or removed.
+        """
         target = target.lower()
 
         if target.startswith('at'):
@@ -591,146 +708,202 @@ class lcogt(object):
         elif target.startswith('sn'):
             target = target[2:]
 
-        target = target.strip()
+        target = target.strip().replace(' ', '_').translate(str.maketrans('', '', '()/'))
 
-        # Need to sanitize target, e.g., for spaces
-        target = target.replace(' ','_')
-        target = target.replace('(','')
-        target = target.replace(')','')
-        target = target.replace('/','')
+        return target
 
-        return(target)
+    @staticmethod
+    def _goodman_wavmode_from_fits(path: str) -> str | None:
+        """Read ``WAVMODE`` from a Goodman fpacked or uncompressed FITS path."""
+        from astropy.io import fits
 
+        try:
+            with fits.open(path) as hdul:
+                pl = path.lower()
+                prefer = (1, 0) if pl.endswith('.fz') or pl.endswith('.fits.fz') else (0, 1)
+                for i in prefer:
+                    if 0 <= i < len(hdul) and 'WAVMODE' in hdul[i].header:
+                        val = str(hdul[i].header['WAVMODE']).strip()
+                        if val:
+                            return val.replace(' ', '_')
+                for i in range(len(hdul)):
+                    hdr = hdul[i].header
+                    if 'WAVMODE' in hdr:
+                        val = str(hdr['WAVMODE']).strip()
+                        if val:
+                            return val.replace(' ', '_')
+        except OSError:
+            return None
+        return None
 
-    # Given an input obslist from the LCOGT archive, download the associated
-    # files for each element
-    def download_obslist(self, obslist, outrootdir='', use_basename=False,
-        skip_header=False, funpack=True, force_objname='', verbose=False,
-        max_tries=4):
-
-        for frame in obslist:
-            filename = ''
-            if use_basename:
-                filename = frame['basename'] + '.fits.fz'
+    def _process_obslist_frame(
+        self,
+        frame,
+        outrootdir,
+        use_basename,
+        skip_header,
+        funpack,
+        force_objname,
+        verbose,
+        max_tries,
+        *,
+        embed_wavmode: bool = False,
+    ):
+        """Download, funpack, and optionally trim headers for one archive frame."""
+        idnum = str(frame['id'])
+        date = Time(frame['DATE_OBS']).datetime.strftime('ut%y%m%d')
+        filename = ''
+        if use_basename:
+            filename = frame['basename'] + '.fits.fz'
+            target = self.sanitize_objname(frame['OBJECT'])
+        else:
+            if force_objname:
+                target = force_objname
             else:
-                if force_objname:
-                    target = force_objname
-                else:
-                    target = self.sanitize_objname(frame['OBJECT'])
+                target = self.sanitize_objname(frame['OBJECT'])
 
-                if not target:
-                    target = 'field'+str(frame['id'])
+            if not target:
+                target = 'field' + str(frame['id'])
 
-                filt = frame['FILTER']
-                idnum = str(frame['id'])
-                date = Time(frame['DATE_OBS']).datetime.strftime('ut%y%m%d')
+            filt = frame.get('FILTER')
+            filt_l = str(filt).lower() if filt is not None else ''
 
-                if filt.lower() in ['opaque']: 
-                    continue
-                elif filt.lower()=='no_filter':
-                    filename = f'{target}.{date}.{idnum}.fits.fz'
-                else:
-                    filename = f'{target}.{date}.{filt}.{idnum}.fits.fz'
+            if filt_l == 'opaque':
+                return
+            if embed_wavmode or filt_l in ('', 'no_filter'):
+                filename = f'{target}.{date}.{idnum}.fits.fz'
+            else:
+                filename = f'{target}.{date}.{filt_l}.{idnum}.fits.fz'
 
-            fullfilename = os.path.join(outrootdir, filename)
-            if not os.path.exists(outrootdir):
-                shutil.os.makedirs(outrootdir)
+        fullfilename = os.path.join(outrootdir, filename)
+        unpacked = fullfilename.removesuffix('.fz')
+        os.makedirs(outrootdir, exist_ok=True)
 
-            tries = 0
-            file_exists = False
-            if funpack:
-                if not os.path.exists(fullfilename.strip('.fz')):
-                    message = 'Downloading LCOGT file: {file}'
-                    print(message.format(file=fullfilename))
-                    url = frame['url']
-                    if verbose:
-                        print(f'Downloading from: {url}')
-
-                    r = None
-                    while tries < max_tries:
-                        try:
-                            r = requests.get(url)
-                            break
-                        except requests.exceptions.ConnectionError:
-                            time.sleep(30)
-                            tries += 1
-
-                    if r is not None and r.status_code==200:
-                        with open(fullfilename, 'wb') as f:
-                            try:
-                                f.write(r.content)
-                            except:
-                                print(f'Failed to download: {fullfilename}')
-                    
-                    if os.path.exists(fullfilename):
-                        file_exists = True
-                else:
-                    message = 'LCOGT file: {file} already exists!'
-                    print(message.format(file=fullfilename.strip('.fz')))
-                    file_exists = True
-
-            elif not os.path.exists(fullfilename):
-                message = 'Downloading LCOGT file: {file}'
-                print(message.format(file=fullfilename))
-                url=frame['url']
-                if verbose:
-                    print(f'Downloading from: {url}')
-
-                r = None
-                while tries < max_tries:
-                    try:
-                        r = requests.get(url)
-                        break
-                    except requests.exceptions.ConnectionError:
-                        time.sleep(30)
-                        tries += 1
-
-                if r is not None and r.status_code==200:
-                    with open(fullfilename, 'wb') as f:
-                        try:
-                            f.write(r.content)
-                        except:
-                            print(f'Failed to download: {fullfilename}')
-                    
+        file_exists = False
+        url = frame['url']
+        if funpack:
+            if os.path.exists(unpacked):
+                logger.info('LCOGT file: %s already exists!', unpacked)
+                file_exists = True
+            else:
+                _archive_download_to_path(url, fullfilename, max_tries, verbose)
                 if os.path.exists(fullfilename):
                     file_exists = True
-            else:
-                message = 'LCOGT file: {file} already exists!'
-                print(message.format(file=fullfilename.strip('.fz')))
+
+        elif not os.path.exists(fullfilename):
+            _archive_download_to_path(url, fullfilename, max_tries, verbose)
+            if os.path.exists(fullfilename):
                 file_exists = True
+        else:
+            logger.info('LCOGT file: %s already exists!', fullfilename)
+            file_exists = True
 
+        if embed_wavmode and os.path.exists(fullfilename):
+            wavmode = self._goodman_wavmode_from_fits(fullfilename)
+            if wavmode:
+                wavname = f'{target}.{date}.{wavmode}.{idnum}.fits.fz'
+                wavpath = os.path.join(outrootdir, wavname)
+                if wavpath != fullfilename:
+                    if os.path.exists(wavpath):
+                        os.remove(fullfilename)
+                        fullfilename = wavpath
+                    else:
+                        os.replace(fullfilename, wavpath)
+                        fullfilename = wavpath
+            else:
+                logger.warning('No WAVMODE in %s; keeping provisional filename', fullfilename)
 
-            # funpack
-            if not os.path.exists(fullfilename.strip('.fz')) and funpack:
-                cmd = 'funpack {file}'
-                os.system(cmd.format(file=fullfilename))
-            if os.path.exists(fullfilename) and funpack:
-                os.remove(fullfilename)
+        if not os.path.exists(unpacked) and funpack:
+            cmd = 'funpack {file}'
+            os.system(cmd.format(file=fullfilename))
+        if os.path.exists(fullfilename) and funpack:
+            os.remove(fullfilename)
 
-            # Remove extraneous extension
-            if not skip_header and not file_exists:
-                hdulist = fits.open(fullfilename.strip('.fz'))
-                newhdu = fits.HDUList()
-                hdu = hdulist['SCI']
-                hdu.header['OBSTYPE'] = 'OBJECT'
-                hdu.header['OBJECT'] = target
-                newhdu.append(hdu)
-                newhdu.writeto(fullfilename.strip('.fz'), overwrite=True)
+        if not skip_header and not file_exists:
+            hdulist = fits.open(unpacked)
+            newhdu = fits.HDUList()
+            hdu = hdulist['SCI']
+            hdu.header['OBSTYPE'] = 'OBJECT'
+            hdu.header['OBJECT'] = target
+            newhdu.append(hdu)
+            newhdu.writeto(unpacked, overwrite=True)
+
+    def download_obslist(self, obslist, outrootdir='', use_basename=False,
+        skip_header=False, funpack=True, force_objname='', verbose=False,
+        max_tries=4, max_download_workers=1, embed_wavmode: bool = False):
+        """Download archive frames to disk, optionally funpack and trim headers.
+
+        Parameters
+        ----------
+        obslist : list of dict
+            Archive ``results`` rows (must include ``url``, ``OBJECT``, etc.).
+        outrootdir : str, optional
+            Output directory (created if missing).
+        use_basename : bool, optional
+            If True, name outputs ``<basename>.fits.fz`` from the archive record.
+        skip_header : bool, optional
+            If False, rewrite a single-extension ``SCI`` HDU after funpack.
+        funpack : bool, optional
+            If True, expand ``.fz`` with ``funpack`` and delete the compressed file.
+        force_objname : str, optional
+            Override object-based filename stems when ``use_basename`` is False.
+        verbose : bool, optional
+            Print download URLs.
+        max_tries : int, optional
+            Retries per file on connection errors.
+        max_download_workers : int, optional
+            If greater than 1, process frames concurrently (I/O bound HTTP downloads).
+            ``funpack`` / FITS post-processing still run inside each worker thread;
+            use modest values (for example 4--8) to avoid throttling by the archive.
+        embed_wavmode : bool, optional
+            If True, after download read Goodman ``WAVMODE`` from the FITS header and
+            rename to ``{target}.{utdate}.{WAVMODE}.{id}.fits.fz``.
+        """
+        if not obslist:
+            return
+        os.makedirs(outrootdir, exist_ok=True)
+        logger.info('Downloading %s LCO frame(s) to %s', len(obslist), outrootdir)
+
+        def _one(frame):
+            return self._process_obslist_frame(
+                frame,
+                outrootdir,
+                use_basename,
+                skip_header,
+                funpack,
+                force_objname,
+                verbose,
+                max_tries,
+                embed_wavmode=embed_wavmode,
+            )
+
+        if max_download_workers <= 1:
+            for frame in obslist:
+                _one(frame)
+            return
+
+        workers = min(max_download_workers, len(obslist))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_one, frame) for frame in obslist]
+            for fut in as_completed(futures):
+                fut.result()
 
     def make_location(self, telescope):
-        return({'telescope_class': telescope})
+        """Build the ``location`` object (telescope class) for a request group."""
+        return {'telescope_class': telescope}
 
     def make_constraints(self):
+        """Return default airmass and lunar separation constraints from ``self.params``."""
         max_airmass = self.params['constraints']['max_airmass']
         min_lunar_distance = self.params['constraints']['min_lunar_distance']
         constraints = {
             'max_airmass': max_airmass,
             'min_lunar_distance': min_lunar_distance
         }
-        return(constraints)
+        return constraints
 
-    # This sets up a target based on name, ra, dec
     def make_target(self, name, ra, dec):
+        """Return an ICRS ``target`` dict for API v3 (fixed proper motion/parallax)."""
         target = {
             'type': 'ICRS',
             'name': name,
@@ -741,11 +914,27 @@ class lcogt(object):
             'parallax': 0.0,
             'epoch': 2000.0
         }
-        return(target)
+        return target
 
-    # This sets up the instrument parameters for an obs
-    # Imaging specific
     def make_instrument_configs(self, filt, exptime, strat, readout='SLOW'):
+        """Return a one-element list of ``instrument_configs`` for the strategy type.
+
+        Parameters
+        ----------
+        filt : str
+            Filter name, ``'spec'`` for spectroscopy templates, or NEWFIRM band.
+        exptime : float or str
+            Exposure time in seconds (string for NEWFIRM ``exposure_time`` field).
+        strat : dict
+            Strategy entry from ``self.params['strategy']``.
+        readout : {'SLOW', 'FAST'}, optional
+            MuSCAT readout mode selector.
+
+        Returns
+        -------
+        list of dict
+            Instrument configuration block consumed by :meth:`make_configurations`.
+        """
         if strat['type']=='default':
             configuration = {
                 'instrument_name': '1M0-SCICAM-SINISTRO',
@@ -845,47 +1034,84 @@ class lcogt(object):
                     "filter": str(filt).lower()
                 }
             }
-        return([configuration])
+        return [configuration]
 
     def make_acquisition_config(self, strat, mode=None):
+        """Return acquisition configuration; defaults to the strategy template value."""
         if not mode:
             mode = strat['acquisition_config']
-        return({'mode': mode})
+        return {'mode': mode}
 
     def make_guiding_config(self, strat):
+        """Return guiding configuration; spectroscopy strategies set ``optional`` False."""
         mode = strat['guiding_config']
         optional = True
         if 'spec' in strat['type']:
             optional=False
-        return({'mode': mode, 'optional': optional})
+        return {'mode': mode, 'optional': optional}
 
-    """
-    Window object for LCOGT API v3.
-    start time = earliest the obs can be executed
-    duration = amount of time in which request can be executed
-    """
     def make_window(self, start, duration):
+        """Define a scheduling window for LCO API v3 (start plus duration in days).
+
+        Parameters
+        ----------
+        start : datetime.datetime
+            Earliest time the observation may execute.
+        duration : float
+            Window length in days.
+
+        Returns
+        -------
+        list of dict
+            One window dict with LCO-formatted ``start`` and ``end`` strings.
+        """
         fmt = self.params['date_format']
         end = start + timedelta(days=duration)
         window = [{
             'start': start.strftime(fmt),
             'end': end.strftime(fmt)
         }]
-        return(window)
+        return window
 
     def post_user_request(self, user_request):
-        # Get username and password
+        """POST a completed user observation request JSON to the LCO request API.
+
+        Parameters
+        ----------
+        user_request : dict
+            Top-level observation request payload.
+
+        Returns
+        -------
+        requests.Response
+            Raw HTTP response from ``requests.post``.
+        """
         username, password = self.get_username_password()
 
         # Get authorization token
         header = self.get_token_header(username, password, auth_type='request')
         uri = self.params['uri']['request']['request']
         response = requests.post(uri, json=user_request, headers=header)
-        return(response)
+        return response
 
     def get_exposure_time(self, filt, mag, strat):
-        # Get preferred snr given input magnitude
-        # Handle 'spec' case
+        """Estimate exposure time in seconds from magnitude, filter, and strategy.
+
+        Parameters
+        ----------
+        filt : str
+            Filter name or ``'spec'`` for FLOYDS-style spectroscopy.
+        mag : float
+            Source magnitude used in the SNR heuristic.
+        strat : dict
+            Strategy dict containing ``snr`` ladder, exposure limits, etc.
+
+        Returns
+        -------
+        float or None
+            Recommended exposure in seconds, or None if above max exposure or
+            spectroscopy rules exclude the source.
+        """
         if filt=='spec':
             if mag < 14:
                 return(300)
@@ -935,10 +1161,19 @@ class lcogt(object):
 
         return(exptime)
 
-    # Get the maximum allowable IPP for a requestgroup
     def get_max_allowable_ipp(self, obs_requests):
+        """Query the API for the maximum allowable IPP for a draft request.
 
-        # Get username and password
+        Parameters
+        ----------
+        obs_requests : dict
+            Observation request JSON as accepted by the ``max_allowable_ipp`` endpoint.
+
+        Returns
+        -------
+        dict
+            Parsed JSON response from the LCO request API.
+        """
         username, password = self.get_username_password()
 
         uri = self.params['uri']['request']['request']+'max_allowable_ipp/'
@@ -948,14 +1183,12 @@ class lcogt(object):
 
         return(response.json())
 
-    """
-    LCO API v3 configurations.
-    configurations consist of constraints, instrument configuration, acquisition
-    configuration, guiding configuration, target, instrument type, exposure
-    type, and observation priority.  This method will construct a series of
-    configurations for a single target.
-    """
     def make_configurations(self, obj, ra, dec, mag, strat, inst_config=[]):
+        """Build LCO API v3 ``configurations`` for one target and strategy.
+
+        Assembles constraints, instrument/acquisition/guiding settings, target
+        metadata, and exposure type per the selected ``strat`` template.
+        """
         # Iterate over each filter and append to configurations list
         configurations = []
 
@@ -1099,14 +1332,9 @@ class lcogt(object):
         return(configurations)
 
 
-    """
-    LCO API v3 request.
-    requests is a list of requests each defined by a location, configuration,
-    and a window.
-    """
     def make_requests(self, obj, ra, dec, mag, strat, start=None,
         inst_config={}):
-
+        """Build the ``requests`` list for an LCO API v3 observation group."""
         location = self.make_location(strat['telescope_class'])
         if start:
             dt = start
@@ -1130,14 +1358,13 @@ class lcogt(object):
 
         return(requests)
 
-    """
-    LCO API v3 observation request.
-    Each method constructs one layer of the request.  Here we need to make the
-    outermost obs request with name, proposal, ipp value, operator, observation
-    type, and the individual requests.  Send the
-    """
     def make_obs_request(self, obj, ra, dec, mag, strategy = 'default',
         propidx=0, start=None, recalculate_ipp=False, inst_config=[]):
+        """Assemble and optionally POST the outermost LCO observation request.
+
+        Wraps proposal metadata, IPP handling, and nested ``requests`` produced by
+        :meth:`make_requests`.
+        """
 
         # Get params - strategy data
         strat = self.params['strategy'][strategy]
@@ -1162,40 +1389,40 @@ class lcogt(object):
         obs_request['requests']=requests
 
         if recalculate_ipp and len(requests[0]['configurations'])>0:
-            print('Recalculating IPP...')
+            logger.info('Recalculating IPP...')
             response = self.get_max_allowable_ipp(obs_request)
-            print(response)
+            logger.debug('max_allowable_ipp response: %s', response)
             try:
                 if 'errors' in response.keys() and 'requests' in response['errors'].keys():
                     data = response['errors']['requests']
                     if 'non_field_errors' in data[0].keys():
-                        print('ERROR in obs request',obs_request)
+                        logger.error('Invalid obs request: %s', obs_request)
                         return(None)
                 elif 'errors' in response.keys():
                     data = response['errors']
                     if 'non_field_errors' in data.keys():
-                        print('ERROR in obs request',obs_request)
+                        logger.error('Invalid obs request: %s', obs_request)
                         return(None)
-            except:
-                pass
+            except Exception:
+                logger.debug('IPP error parsing skipped', exc_info=True)
             max_ipp = None
             for key in response.keys():
                 r = response[key]
                 for key in r.keys():
                     ipp_data = r[key]
-                    print(ipp_data)
+                    logger.debug('IPP data: %s', ipp_data)
                     if 'max_allowable_ipp_value' in ipp_data.keys():
                         max_ipp = ipp_data['max_allowable_ipp_value']
 
             if max_ipp:
                 curr_ipp = obs_request['ipp_value']
                 if max_ipp < curr_ipp:
-                    print('Adjusting IPP value to:',max_ipp)
+                    logger.info('Adjusting IPP value to: %s', max_ipp)
                     obs_request['ipp_value']=max_ipp
                 else:
                     m = 'No need to adjust IPP, {0} < {1}'.format(curr_ipp,
                         max_ipp)
-                    print(m)
+                    logger.info('%s', m)
 
 
         if not requests[0]['configurations']:

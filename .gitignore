@@ -206,6 +206,18 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Ignore caldb plot files
-caldb/plots/
-caldb/plots/*.pdf
+# Ignore packaged caldb plot artifacts
+passta/caldb/plots/
+passta/caldb/plots/*.pdf
+
+# setuptools-scm (generated on pip install / build)
+passta/_version.py
+
+# Local test spectra, figures, and calibration artifacts
+test_data/
+
+# Background job logs
+nohup.out
+
+# Vendored SNID-SAGE templates (use PyPI snid-sage package instead)
+SNID-SAGE/
