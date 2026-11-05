@@ -66,10 +66,14 @@ def main(date, propid, outdir='.'):
 
         obslist = copy.copy(outobslist)
 
+        # Goodman only: skip TripleSpec and any other instrument on SOAR
+        obslist = [o for o in obslist if o['INSTRUME'].lower().startswith('ghts')]
+
         # Get any standard star calibration files
         callist = lco.get_obslist(sdate=sdate, edate=edate,
             propid=['calibrate'], telid=telid, rlevel=[0,62,63,64],
             obstype='SPECTRUM')
+        callist = [o for o in callist if o['INSTRUME'].lower().startswith('ghts')]
 
         instlist = []
         for obs in obslist:
